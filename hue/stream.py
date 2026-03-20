@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -85,7 +86,7 @@ def stop_stream():
 
     _clear_pid()
     # Give the bridge a moment to fully release the session
-    time.sleep(1.0)
+    time.sleep(2.0)
     return True
 
 
@@ -206,11 +207,11 @@ def run_stream_loop(
     def _cleanup(signum, frame):
         _log("Received SIGTERM, stopping stream")
         _clear_pid()
-        try:
-            streaming.stop_stream()
-        except Exception:
-            pass
-        _log("Stream stopped, exiting")
+        # Run stop_stream in a thread with a hard timeout — it can hang
+        t = threading.Thread(target=lambda: streaming.stop_stream(), daemon=True)
+        t.start()
+        t.join(timeout=1.0)
+        _log("Stream stop attempted, exiting")
         os._exit(0)
 
     signal.signal(signal.SIGTERM, _cleanup)

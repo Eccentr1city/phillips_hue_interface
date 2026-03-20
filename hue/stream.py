@@ -160,15 +160,9 @@ def run_stream_loop(
     _write_pid()
     _log(f"Stream child started (pid={os.getpid()})")
 
-    def _cleanup(signum, frame):
-        _log("Received SIGTERM, exiting immediately")
-        _clear_pid()
-        # Use os._exit to skip finally blocks — avoids slow streaming.stop_stream()
-        # which can hold the DTLS session for seconds and block the next connection.
-        os._exit(0)
-
-    signal.signal(signal.SIGTERM, _cleanup)
-    signal.signal(signal.SIGINT, _cleanup)
+    # Placeholder — will be replaced with a closure once streaming object exists
+    signal.signal(signal.SIGINT, lambda s, f: os._exit(0))
+    signal.signal(signal.SIGTERM, lambda s, f: os._exit(0))
 
     # Resolve effect names to render functions
     render_map: dict[int, dict] = {}
@@ -207,6 +201,20 @@ def run_stream_loop(
 
     streaming = hep.Streaming(bridge, ent_config, ent_conf_repo)
     streaming.set_color_space("rgb")
+
+    # Now install the real signal handler that can close the DTLS session
+    def _cleanup(signum, frame):
+        _log("Received SIGTERM, stopping stream")
+        _clear_pid()
+        try:
+            streaming.stop_stream()
+        except Exception:
+            pass
+        _log("Stream stopped, exiting")
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _cleanup)
+    signal.signal(signal.SIGINT, _cleanup)
 
     # Retry DTLS handshake — bridge may need a moment after previous session
     for attempt in range(3):

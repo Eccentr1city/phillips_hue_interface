@@ -1,9 +1,13 @@
 """Scene definition, save/load, and apply logic."""
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from hue.bridge import Bridge
+if TYPE_CHECKING:
+    from hue.bridge import Bridge
 
 SCENES_DIR = Path(__file__).resolve().parent.parent / "scenes"
 
@@ -42,11 +46,6 @@ def save_scene(name: str, lights: dict) -> Path:
     Args:
         name: Scene name (becomes the filename).
         lights: Dict mapping light IDs (as strings) to configs.
-            Each config can have:
-            - "color": color name or hex
-            - "brightness": 0.0-1.0
-            - "effect": effect name
-            - "params": effect parameters dict
 
     Returns:
         Path to the saved scene file.
@@ -56,6 +55,33 @@ def save_scene(name: str, lights: dict) -> Path:
     path = SCENES_DIR / f"{name}.json"
     path.write_text(json.dumps(data, indent=2) + "\n")
     return path
+
+
+def save_scene_from_current(bridge: Bridge, name: str) -> Path:
+    """Snapshot the current state of all lights and save as a scene.
+
+    Captures on/off, brightness, hue, saturation, and color temp for each light.
+    """
+    lights_config: dict[str, dict] = {}
+    for lid, light in sorted(bridge.lights.items()):
+        state = light.state
+        if not state.get("reachable", False):
+            continue
+        config: dict = {"on": state.get("on", False)}
+        if state.get("bri") is not None:
+            config["brightness"] = round(state["bri"] / 254, 2)
+        # Store raw hue/sat so we can restore exactly
+        if state.get("hue") is not None:
+            config["hue"] = state["hue"]
+        if state.get("sat") is not None:
+            config["sat"] = state["sat"]
+        if state.get("ct") is not None:
+            config["ct"] = state["ct"]
+        if state.get("colormode"):
+            config["colormode"] = state["colormode"]
+        lights_config[str(lid)] = config
+
+    return save_scene(name, lights_config)
 
 
 def apply_scene(bridge: Bridge, name: str) -> dict:
@@ -75,24 +101,39 @@ def apply_scene(bridge: Bridge, name: str) -> dict:
     static_ids = []
     effect_ids = []
 
-    # Apply static lights via REST
     for light_id_str, config in lights_config.items():
         light_id = int(light_id_str)
         if "effect" in config:
             effect_ids.append(light_id)
             continue
 
-        # Static light
+        # Static light — apply via REST
         static_ids.append(light_id)
         try:
             light = bridge.light(light_id)
-            light.set(
-                color=config.get("color"),
-                brightness=config.get("brightness"),
-                on=config.get("on", True),
-            )
+            # If scene has raw hue/sat/ct, use those directly for exact restore
+            if "hue" in config or "sat" in config or "ct" in config:
+                raw_state: dict = {}
+                raw_state["on"] = config.get("on", True)
+                if config.get("brightness") is not None:
+                    raw_state["bri"] = max(1, int(config["brightness"] * 254))
+                colormode = config.get("colormode", "hs")
+                if colormode == "ct" and "ct" in config:
+                    raw_state["ct"] = config["ct"]
+                else:
+                    if "hue" in config:
+                        raw_state["hue"] = config["hue"]
+                    if "sat" in config:
+                        raw_state["sat"] = config["sat"]
+                light._put_state(raw_state)
+            else:
+                light.set(
+                    color=config.get("color"),
+                    brightness=config.get("brightness"),
+                    on=config.get("on", True),
+                )
         except KeyError:
-            pass  # Light not found on bridge, skip
+            pass
 
     # Fork streaming for effect lights
     pid = None

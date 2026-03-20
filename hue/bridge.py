@@ -12,10 +12,7 @@ from dotenv import load_dotenv
 if TYPE_CHECKING:
     from hue.light import Light
 
-# Suppress SSL warnings for local bridge communication
-requests.packages.urllib3.disable_warnings()
-
-# Well-known color names → (hue, saturation) for Hue API (hue: 0-65535, sat: 0-254)
+# Well-known color names -> (hue, saturation) for Hue API (hue: 0-65535, sat: 0-254)
 COLOR_MAP = {
     "red": (0, 254),
     "orange": (5000, 254),
@@ -53,48 +50,74 @@ class Bridge:
                 "Missing HUE_BRIDGE_IP or HUE_API_KEY. Run setup.py first."
             )
 
-        self._base_url = f"https://{self.ip}/api/{self.api_key}"
-        self._lights: dict[int, "Light"] | None = None
+        self._base_url = f"http://{self.ip}/api/{self.api_key}"
+        self._lights: dict[int, Light] | None = None
 
     def _get(self, path: str) -> dict:
-        resp = requests.get(f"{self._base_url}{path}", verify=False, timeout=10)
+        resp = requests.get(f"{self._base_url}{path}", timeout=10)
         resp.raise_for_status()
         return resp.json()
 
     def _put(self, path: str, data: dict) -> list:
-        resp = requests.put(
-            f"{self._base_url}{path}", json=data, verify=False, timeout=10
-        )
+        resp = requests.put(f"{self._base_url}{path}", json=data, timeout=10)
         resp.raise_for_status()
         return resp.json()
 
-    def discover_lights(self) -> dict[int, "Light"]:
+    def info(self) -> dict:
+        """Get bridge configuration info."""
+        resp = requests.get(f"http://{self.ip}/api/{self.api_key}/config", timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def discover_lights(self) -> dict[int, Light]:
         """Fetch all lights from the bridge and return as Light objects."""
         from hue.light import Light
 
         raw = self._get("/lights")
         lights = {}
-        for lid_str, info in raw.items():
+        for lid_str, data in raw.items():
             lid = int(lid_str)
             lights[lid] = Light(
-                bridge=self, id=lid, name=info.get("name", f"Light {lid}"), raw=info
+                bridge=self, id=lid, name=data.get("name", f"Light {lid}"), raw=data
             )
         self._lights = lights
         return lights
 
     @property
-    def lights(self) -> dict[int, "Light"]:
+    def lights(self) -> dict[int, Light]:
         if self._lights is None:
             self.discover_lights()
         return self._lights
 
-    def light(self, id_or_name: int | str) -> "Light":
+    def resolve_lights(self, target: int | str | list) -> list[Light]:
+        """Resolve a flexible light target to a list of Light objects.
+
+        Args:
+            target: Light ID (int), light name (str), "all", or a list of IDs/names.
+        """
+        if isinstance(target, list):
+            result = []
+            for item in target:
+                result.extend(self.resolve_lights(item))
+            return result
+        if isinstance(target, str) and target.lower() == "all":
+            return list(self.lights.values())
+        return [self.light(target)]
+
+    def light(self, id_or_name: int | str) -> Light:
         """Get a light by ID (int) or name (str)."""
         lights = self.lights
         if isinstance(id_or_name, int):
             if id_or_name not in lights:
                 raise KeyError(f"No light with ID {id_or_name}")
             return lights[id_or_name]
+        # Try parsing as int first (e.g. "1" from tool calls)
+        try:
+            lid = int(id_or_name)
+            if lid in lights:
+                return lights[lid]
+        except ValueError:
+            pass
         # Search by name (case-insensitive)
         for light in lights.values():
             if light.name.lower() == id_or_name.lower():
@@ -102,7 +125,7 @@ class Bridge:
         raise KeyError(f"No light named '{id_or_name}'")
 
     @property
-    def all(self) -> "AllLights":
+    def all(self) -> AllLights:
         return AllLights(self)
 
 

@@ -1,14 +1,25 @@
 """Hob tool definitions — exports TOOL_DEFINITIONS and TOOL_FUNCTIONS.
 
 Drop-in replacement for ~/hob/hue_tools.py. All functions are async.
+
+Tools:
+  hue_status  — lights + bridge info in one call
+  hue_set     — the everything tool: lights, color, brightness, on/off, effects, scenes
+  hue_stop    — stop streaming effects
+  hue_list    — list available effects and saved scenes
+  hue_define_effect — create a new effect .py file
+  hue_define_scene  — create/update a scene (explicit config or snapshot current state)
 """
 
 from pathlib import Path
 
 TOOL_DEFINITIONS = [
     {
-        "name": "hue_list_lights",
-        "description": "List all Hue lights with their current state (on/off, color, brightness).",
+        "name": "hue_status",
+        "description": (
+            "Get the current state of all Hue lights and bridge info. "
+            "Returns each light's name, on/off, brightness, color, and reachability."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {},
@@ -16,34 +27,63 @@ TOOL_DEFINITIONS = [
         },
     },
     {
-        "name": "hue_set_light",
-        "description": "Set a Hue light to a static color, brightness, or on/off state.",
+        "name": "hue_set",
+        "description": (
+            "Control Hue lights. Set color, brightness, on/off, or start an effect. "
+            "Can also apply a saved scene by name. "
+            "Colors: red, orange, yellow, green, cyan, blue, purple, pink, white, "
+            "warm white, cool white, or hex (#RRGGBB). Brightness: 0.0-1.0."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "light": {
-                    "type": ["integer", "string"],
-                    "description": "Light ID (integer) or name (string).",
+                "lights": {
+                    "description": (
+                        "Which lights to control. "
+                        'Light ID (int), name (string), "all", '
+                        "or a list of IDs/names. Not needed if setting a scene."
+                    ),
                 },
                 "color": {
                     "type": "string",
-                    "description": "Color name (red, blue, warm white, etc.) or hex (#RRGGBB). Optional.",
+                    "description": "Color name or hex (#RRGGBB).",
                 },
                 "brightness": {
                     "type": "number",
-                    "description": "Brightness from 0.0 to 1.0. Optional.",
+                    "description": "Brightness 0.0-1.0.",
                 },
                 "on": {
                     "type": "boolean",
-                    "description": "Turn on (true) or off (false). Optional.",
+                    "description": "Turn on/off.",
+                },
+                "effect": {
+                    "type": "string",
+                    "description": "Start a named effect (e.g. 'candle', 'breathe').",
+                },
+                "effect_params": {
+                    "type": "object",
+                    "description": "Parameters to pass to the effect's render function.",
+                },
+                "scene": {
+                    "type": "string",
+                    "description": "Apply a saved scene by name (ignores other params).",
                 },
             },
-            "required": ["light"],
+            "required": [],
         },
     },
     {
-        "name": "hue_list_effects",
-        "description": "List all available lighting effects (built-in and user-defined).",
+        "name": "hue_stop",
+        "description": "Stop any running streaming effects.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "hue_list",
+        "description": "List available effects and saved scenes.",
         "input_schema": {
             "type": "object",
             "properties": {},
@@ -52,34 +92,32 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "hue_define_effect",
-        "description": "Create a new lighting effect by writing a Python file with a render(t, **params) -> (r, g, b) function.",
+        "description": (
+            "Create a new lighting effect by writing a Python file. "
+            "Must define: render(t, **params) -> (r, g, b) "
+            "where t is elapsed seconds and rgb are 0-255."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Effect name (becomes the filename, e.g. 'campfire').",
+                    "description": "Effect name (e.g. 'lava', 'campfire').",
                 },
                 "code": {
                     "type": "string",
-                    "description": "Python source code. Must define render(t, **params) -> (r, g, b) where t is elapsed seconds and rgb are 0-255.",
+                    "description": "Python source code with a render(t, **params) function.",
                 },
             },
             "required": ["name", "code"],
         },
     },
     {
-        "name": "hue_list_scenes",
-        "description": "List all saved lighting scenes.",
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
-    },
-    {
         "name": "hue_define_scene",
-        "description": "Create or update a scene — a named configuration mapping lights to colors or effects.",
+        "description": (
+            "Save a scene. Either provide an explicit lights config, "
+            "or set from_current=true to snapshot whatever the lights are doing right now."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -89,42 +127,18 @@ TOOL_DEFINITIONS = [
                 },
                 "lights": {
                     "type": "object",
-                    "description": "Mapping of light ID (string) to config. Each config can have: color (string), brightness (number 0-1), effect (string effect name), params (object of effect parameters).",
-                    "additionalProperties": {
-                        "type": "object",
-                        "properties": {
-                            "color": {"type": "string"},
-                            "brightness": {"type": "number"},
-                            "effect": {"type": "string"},
-                            "params": {"type": "object"},
-                        },
-                    },
+                    "description": (
+                        "Mapping of light ID (string) to config. Each config can have: "
+                        "color, brightness (0-1), effect (name), params (effect params). "
+                        "Not needed if from_current is true."
+                    ),
                 },
-            },
-            "required": ["name", "lights"],
-        },
-    },
-    {
-        "name": "hue_set_scene",
-        "description": "Apply a saved scene. Static lights are set via REST; lights with effects start a background streaming process.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Name of the scene to apply.",
+                "from_current": {
+                    "type": "boolean",
+                    "description": "If true, snapshot the current state of all lights as the scene.",
                 },
             },
             "required": ["name"],
-        },
-    },
-    {
-        "name": "hue_stop_scene",
-        "description": "Stop any running streaming effect and kill the background process.",
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
         },
     },
 ]
@@ -136,49 +150,143 @@ def _get_bridge():
     return Bridge()
 
 
-async def hue_list_lights(**kwargs) -> str:
+async def hue_status(**kwargs) -> str:
     bridge = _get_bridge()
-    lights = bridge.lights
-    result = []
-    for lid, light in sorted(lights.items()):
+
+    # Bridge info
+    cfg = bridge.info()
+    info_lines = [
+        f"Bridge: {cfg.get('name', '?')} ({cfg.get('modelid', '?')})",
+        f"  IP: {bridge.ip} | API: {cfg.get('apiversion', '?')} | SW: {cfg.get('swversion', '?')}",
+        "",
+    ]
+
+    # Lights
+    light_lines = []
+    for lid, light in sorted(bridge.lights.items()):
         state = light.state
-        result.append(
-            {
-                "id": lid,
-                "name": light.name,
-                "on": state.get("on", False),
-                "brightness": round(state.get("bri", 0) / 254, 2),
-                "reachable": state.get("reachable", False),
-            }
+        on_off = "ON" if state.get("on") else "OFF"
+        reachable = "" if state.get("reachable") else " UNREACHABLE"
+        bri = state.get("bri")
+        bri_str = f" bri={round(bri / 254, 2)}" if bri is not None else ""
+        hue_val = state.get("hue")
+        sat_val = state.get("sat")
+        ct_val = state.get("ct")
+        color_parts = []
+        if hue_val is not None:
+            color_parts.append(f"hue={hue_val}")
+        if sat_val is not None:
+            color_parts.append(f"sat={sat_val}")
+        if ct_val is not None:
+            color_parts.append(f"ct={ct_val}")
+        color_str = f" ({', '.join(color_parts)})" if color_parts else ""
+        light_lines.append(
+            f"  [{lid}] {light.name}: {on_off}{bri_str}{color_str}{reachable}"
         )
-    import json
 
-    return json.dumps(result, indent=2)
+    return "\n".join(info_lines + light_lines)
 
 
-async def hue_set_light(light, color=None, brightness=None, on=None, **kwargs) -> str:
+async def hue_set(
+    lights=None,
+    color=None,
+    brightness=None,
+    on=None,
+    effect=None,
+    effect_params=None,
+    scene=None,
+    **kwargs,
+) -> str:
     bridge = _get_bridge()
-    target = bridge.light(light)
-    target.set(color=color, brightness=brightness, on=on)
-    return f"Light '{target.name}' updated."
 
+    # Scene mode — apply a saved scene and return
+    if scene is not None:
+        from hue.scene import apply_scene
 
-async def hue_list_effects(**kwargs) -> str:
-    from hue.effects import list_effects
-    import json
+        result = apply_scene(bridge, scene)
+        parts = []
+        if result["static"]:
+            parts.append(f"{len(result['static'])} static")
+        if result["streaming"]:
+            parts.append(f"{len(result['streaming'])} streaming")
+        return f"Scene '{scene}' applied: {', '.join(parts) or 'empty'}."
 
-    effects = list_effects()
-    return json.dumps(
-        [
-            {
-                "name": e["name"],
-                "builtin": e["builtin"],
-                "description": e["description"],
+    if lights is None:
+        return "Error: specify 'lights' (ID, name, list, or 'all') or 'scene'."
+
+    resolved = bridge.resolve_lights(lights)
+
+    # Effect mode — start streaming effects on the target lights
+    if effect is not None:
+        from hue.effects import get_effect
+        from hue.stream import fork_stream, stop_stream
+
+        get_effect(effect)  # validate it exists
+        stop_stream()
+
+        # Build a scene-like dict for fork_stream
+        scene_data = {
+            "lights": {
+                str(light.id): {
+                    "effect": effect,
+                    "params": effect_params or {},
+                }
+                for light in resolved
             }
-            for e in effects
-        ],
-        indent=2,
-    )
+        }
+        pid = fork_stream(bridge.ip, bridge.api_key, bridge.client_key, scene_data)
+        names = ", ".join(light.name for light in resolved)
+        return f"Effect '{effect}' started on {names} (pid={pid})."
+
+    # Static mode — set color/brightness/on/off
+    names = []
+    for light in resolved:
+        light.set(color=color, brightness=brightness, on=on)
+        names.append(light.name)
+
+    parts = []
+    if on is not None:
+        parts.append("on" if on else "off")
+    if color:
+        parts.append(f"color={color}")
+    if brightness is not None:
+        parts.append(f"brightness={brightness}")
+    return f"Set {', '.join(names)}: {', '.join(parts) or 'updated'}."
+
+
+async def hue_stop(**kwargs) -> str:
+    from hue.scene import stop_scene
+
+    if stop_scene():
+        return "Streaming stopped."
+    return "No streaming process was running."
+
+
+async def hue_list(**kwargs) -> str:
+    from hue.effects import list_effects
+    from hue.scene import list_scenes
+
+    lines = ["Effects:"]
+    effects = list_effects()
+    if effects:
+        for eff in effects:
+            source = "built-in" if eff["builtin"] else "user"
+            desc = f" -- {eff['description']}" if eff["description"] else ""
+            lines.append(f"  {eff['name']} ({source}){desc}")
+    else:
+        lines.append("  (none)")
+
+    lines.append("")
+    lines.append("Scenes:")
+    scenes = list_scenes()
+    if scenes:
+        for scene in scenes:
+            count = len(scene["lights"])
+            lines.append(f"  {scene['name']} ({count} light(s))")
+    else:
+        lines.append("  (none)")
+
+    return "\n".join(lines)
 
 
 async def hue_define_effect(name: str, code: str, **kwargs) -> str:
@@ -187,64 +295,41 @@ async def hue_define_effect(name: str, code: str, **kwargs) -> str:
     path = effects_dir / f"{name}.py"
     path.write_text(code)
 
-    # Verify it loads
     from hue.effects import get_effect
 
     try:
         get_effect(name)
-    except Exception as e:
+    except Exception as exc:
         path.unlink()
-        return f"Error: effect code is invalid — {e}"
+        return f"Error: effect code is invalid -- {exc}"
 
     return f"Effect '{name}' saved to {path}."
 
 
-async def hue_list_scenes(**kwargs) -> str:
-    from hue.scene import list_scenes
-    import json
+async def hue_define_scene(
+    name: str, lights: dict | None = None, from_current: bool = False, **kwargs
+) -> str:
+    if from_current:
+        from hue.scene import save_scene_from_current
 
-    scenes = list_scenes()
-    return json.dumps(
-        [{"name": s["name"], "lights": s["lights"]} for s in scenes],
-        indent=2,
-    )
+        bridge = _get_bridge()
+        path = save_scene_from_current(bridge, name)
+        return f"Scene '{name}' saved from current state to {path}."
 
+    if lights is None:
+        return "Error: provide 'lights' config or set from_current=true."
 
-async def hue_define_scene(name: str, lights: dict, **kwargs) -> str:
     from hue.scene import save_scene
 
     path = save_scene(name, lights)
     return f"Scene '{name}' saved to {path}."
 
 
-async def hue_set_scene(name: str, **kwargs) -> str:
-    from hue.scene import apply_scene
-
-    bridge = _get_bridge()
-    result = apply_scene(bridge, name)
-    parts = []
-    if result["static"]:
-        parts.append(f"{len(result['static'])} static light(s)")
-    if result["streaming"]:
-        parts.append(f"{len(result['streaming'])} streaming light(s)")
-    return f"Scene '{name}' applied: {', '.join(parts) or 'empty scene'}."
-
-
-async def hue_stop_scene(**kwargs) -> str:
-    from hue.scene import stop_scene
-
-    if stop_scene():
-        return "Streaming stopped."
-    return "No streaming process was running."
-
-
 TOOL_FUNCTIONS = {
-    "hue_list_lights": hue_list_lights,
-    "hue_set_light": hue_set_light,
-    "hue_list_effects": hue_list_effects,
+    "hue_status": hue_status,
+    "hue_set": hue_set,
+    "hue_stop": hue_stop,
+    "hue_list": hue_list,
     "hue_define_effect": hue_define_effect,
-    "hue_list_scenes": hue_list_scenes,
     "hue_define_scene": hue_define_scene,
-    "hue_set_scene": hue_set_scene,
-    "hue_stop_scene": hue_stop_scene,
 }

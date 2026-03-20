@@ -4,11 +4,13 @@ import os
 import signal
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import requests
 
 PID_FILE = Path(__file__).resolve().parent.parent / ".hue_stream.pid"
+LOG_FILE = Path(__file__).resolve().parent.parent / ".hue_stream.log"
 
 
 def _write_pid():
@@ -18,6 +20,12 @@ def _write_pid():
 def _clear_pid():
     if PID_FILE.exists():
         PID_FILE.unlink()
+
+
+def _log(msg: str):
+    """Append a line to the stream log file for debugging."""
+    with open(LOG_FILE, "a") as f:
+        f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
 
 
 def get_running_pid() -> int | None:
@@ -34,16 +42,35 @@ def get_running_pid() -> int | None:
 
 
 def stop_stream():
-    """Kill the running stream process if any."""
+    """Kill the running stream process and wait for it to exit."""
     pid = get_running_pid()
-    if pid is not None:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+    if pid is None:
+        return False
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
         _clear_pid()
         return True
-    return False
+
+    # Wait for the process to actually die so the bridge releases the DTLS session
+    for _ in range(30):  # up to 3 seconds
+        try:
+            os.kill(pid, 0)
+            time.sleep(0.1)
+        except ProcessLookupError:
+            break
+
+    # Reap zombie if we're the parent
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+
+    _clear_pid()
+    # Give the bridge a moment to fully release the session
+    time.sleep(0.5)
+    return True
 
 
 def _build_light_to_channel_map(bridge_ip: str, api_key: str) -> dict[int, int]:
@@ -63,7 +90,6 @@ def _build_light_to_channel_map(bridge_ip: str, api_key: str) -> dict[int, int]:
         timeout=10,
     )
     ent_services = resp.json().get("data", [])
-    # entertainment_rid -> v1 light id (from id_v1 field like "/lights/2")
     ent_rid_to_v1: dict[str, int] = {}
     for svc in ent_services:
         v1 = svc.get("id_v1", "")
@@ -90,7 +116,6 @@ def _build_light_to_channel_map(bridge_ip: str, api_key: str) -> dict[int, int]:
             ent_rid = members[0]["service"]["rid"]
             channel_to_ent_rid[cid] = ent_rid
 
-    # Combine: v1 light id -> channel id
     light_to_channel: dict[int, int] = {}
     for cid, ent_rid in channel_to_ent_rid.items():
         v1_id = ent_rid_to_v1.get(ent_rid)
@@ -107,20 +132,14 @@ def run_stream_loop(
     light_effects: dict[int, dict],
     fps: int = 25,
 ):
-    """Run the DTLS streaming render loop (blocking). Called in the forked subprocess.
-
-    Args:
-        bridge_ip: Bridge IP address.
-        api_key: Hue API key (username).
-        client_key: Hue entertainment client key.
-        light_effects: Mapping of v1 light ID -> {"render": callable, "params": dict}.
-        fps: Frames per second (default 25).
-    """
+    """Run the DTLS streaming render loop (blocking). Called in the forked subprocess."""
     import hue_entertainment_pykit as hep
 
     _write_pid()
+    _log(f"Stream child started (pid={os.getpid()})")
 
     def _cleanup(signum, frame):
+        _log("Received SIGTERM, exiting")
         _clear_pid()
         sys.exit(0)
 
@@ -129,6 +148,7 @@ def run_stream_loop(
 
     # Build light ID -> channel ID mapping
     light_to_channel = _build_light_to_channel_map(bridge_ip, api_key)
+    _log(f"Channel map: {light_to_channel}")
 
     bridge = hep.create_bridge(
         identification="",
@@ -144,7 +164,7 @@ def run_stream_loop(
     ent = hep.Entertainment(bridge)
     configs = ent.get_entertainment_configs()
     if not configs:
-        print("No entertainment areas configured on bridge.", file=sys.stderr)
+        _log("ERROR: No entertainment areas configured on bridge")
         _clear_pid()
         sys.exit(1)
 
@@ -154,7 +174,22 @@ def run_stream_loop(
 
     streaming = hep.Streaming(bridge, ent_config, ent_conf_repo)
     streaming.set_color_space("rgb")
-    streaming.start_stream()
+
+    # Retry DTLS handshake — bridge may need a moment after previous session
+    for attempt in range(3):
+        try:
+            _log(f"DTLS handshake attempt {attempt + 1}")
+            streaming.start_stream()
+            _log("DTLS stream started")
+            break
+        except Exception as exc:
+            _log(f"DTLS handshake failed: {exc}")
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                _log("DTLS handshake failed after 3 attempts, giving up")
+                _clear_pid()
+                sys.exit(1)
 
     try:
         interval = 1.0 / fps
@@ -178,10 +213,14 @@ def run_stream_loop(
             if sleep_time > 0:
                 time.sleep(sleep_time)
     except Exception as exc:
-        print(f"Stream error: {exc}", file=sys.stderr)
+        _log(f"Stream loop error: {exc}")
     finally:
-        streaming.stop_stream()
+        try:
+            streaming.stop_stream()
+        except Exception:
+            pass
         _clear_pid()
+        _log("Stream child exited")
 
 
 def fork_stream(
@@ -210,13 +249,17 @@ def fork_stream(
     if not light_effects:
         return None
 
+    # Ignore SIGCHLD so forked children don't become zombies
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+
     pid = os.fork()
     if pid == 0:
-        # Child process
+        # Child process — detach from parent
         try:
+            os.setsid()
             run_stream_loop(bridge_ip, api_key, client_key, light_effects)
         except Exception:
-            pass
+            _log(f"Fork child exception: {traceback.format_exc()}")
         finally:
             os._exit(0)
     else:

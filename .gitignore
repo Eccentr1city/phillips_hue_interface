@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .python-version
 .hue_stream.pid
+.hue_stream.log

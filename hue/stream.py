@@ -1,10 +1,12 @@
-"""Streaming engine wrapping hue-entertainment-pykit for real-time effects."""
+"""Streaming engine using hue-entertainment-pykit for real-time DTLS effects."""
 
 import os
 import signal
 import sys
 import time
 from pathlib import Path
+
+import requests
 
 PID_FILE = Path(__file__).resolve().parent.parent / ".hue_stream.pid"
 
@@ -24,8 +26,7 @@ def get_running_pid() -> int | None:
         return None
     try:
         pid = int(PID_FILE.read_text().strip())
-        # Check if process is alive
-        os.kill(pid, 0)
+        os.kill(pid, 0)  # check alive
         return pid
     except (ValueError, ProcessLookupError, PermissionError):
         _clear_pid()
@@ -45,6 +46,60 @@ def stop_stream():
     return False
 
 
+def _build_light_to_channel_map(bridge_ip: str, api_key: str) -> dict[int, int]:
+    """Build a mapping from v1 light IDs to entertainment channel IDs.
+
+    Queries the v2 API to correlate entertainment services, light services,
+    and channel assignments in the entertainment configuration.
+    """
+    headers = {"hue-application-key": api_key}
+    base = f"https://{bridge_ip}"
+
+    # Get entertainment services: maps entertainment_rid -> v1 light id
+    resp = requests.get(
+        f"{base}/clip/v2/resource/entertainment",
+        headers=headers,
+        verify=False,
+        timeout=10,
+    )
+    ent_services = resp.json().get("data", [])
+    # entertainment_rid -> v1 light id (from id_v1 field like "/lights/2")
+    ent_rid_to_v1: dict[str, int] = {}
+    for svc in ent_services:
+        v1 = svc.get("id_v1", "")
+        if v1.startswith("/lights/"):
+            ent_rid_to_v1[svc["id"]] = int(v1.split("/")[-1])
+
+    # Get entertainment configuration: maps channel_id -> entertainment_rid
+    resp = requests.get(
+        f"{base}/clip/v2/resource/entertainment_configuration",
+        headers=headers,
+        verify=False,
+        timeout=10,
+    )
+    configs = resp.json().get("data", [])
+    if not configs:
+        return {}
+
+    config = configs[0]
+    channel_to_ent_rid: dict[int, str] = {}
+    for channel in config.get("channels", []):
+        cid = channel["channel_id"]
+        members = channel.get("members", [])
+        if members:
+            ent_rid = members[0]["service"]["rid"]
+            channel_to_ent_rid[cid] = ent_rid
+
+    # Combine: v1 light id -> channel id
+    light_to_channel: dict[int, int] = {}
+    for cid, ent_rid in channel_to_ent_rid.items():
+        v1_id = ent_rid_to_v1.get(ent_rid)
+        if v1_id is not None:
+            light_to_channel[v1_id] = cid
+
+    return light_to_channel
+
+
 def run_stream_loop(
     bridge_ip: str,
     api_key: str,
@@ -52,24 +107,16 @@ def run_stream_loop(
     light_effects: dict[int, dict],
     fps: int = 25,
 ):
-    """Run the streaming render loop (blocking). Called in the forked subprocess.
+    """Run the DTLS streaming render loop (blocking). Called in the forked subprocess.
 
     Args:
         bridge_ip: Bridge IP address.
         api_key: Hue API key (username).
         client_key: Hue entertainment client key.
-        light_effects: Mapping of light ID → {"render": callable, "params": dict}.
+        light_effects: Mapping of v1 light ID -> {"render": callable, "params": dict}.
         fps: Frames per second (default 25).
     """
-    try:
-        from HueEntertainmentPykit import Entertainment, Streaming
-    except ImportError:
-        print(
-            "hue-entertainment-pykit is required for streaming effects. "
-            "Install with: uv add hue-entertainment-pykit",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    import hue_entertainment_pykit as hep
 
     _write_pid()
 
@@ -80,33 +127,60 @@ def run_stream_loop(
     signal.signal(signal.SIGTERM, _cleanup)
     signal.signal(signal.SIGINT, _cleanup)
 
-    try:
-        # Set up entertainment API connection
-        ent = Entertainment(bridge_ip, api_key, client_key)
-        ent.create_group(list(light_effects.keys()))
-        streaming = Streaming(ent)
-        streaming.start()
+    # Build light ID -> channel ID mapping
+    light_to_channel = _build_light_to_channel_map(bridge_ip, api_key)
 
+    bridge = hep.create_bridge(
+        identification="",
+        rid="",
+        ip_address=bridge_ip,
+        swversion=0,
+        username=api_key,
+        hue_app_id="phillips_hue_interface",
+        clientkey=client_key,
+        name="Hue Bridge",
+    )
+
+    ent = hep.Entertainment(bridge)
+    configs = ent.get_entertainment_configs()
+    if not configs:
+        print("No entertainment areas configured on bridge.", file=sys.stderr)
+        _clear_pid()
+        sys.exit(1)
+
+    config_id = list(configs.keys())[0]
+    ent_config = configs[config_id]
+    ent_conf_repo = ent.get_ent_conf_repo()
+
+    streaming = hep.Streaming(bridge, ent_config, ent_conf_repo)
+    streaming.set_color_space("rgb")
+    streaming.start_stream()
+
+    try:
         interval = 1.0 / fps
         start_time = time.monotonic()
 
         while True:
             t = time.monotonic() - start_time
             for light_id, effect_info in light_effects.items():
+                channel_id = light_to_channel.get(light_id)
+                if channel_id is None:
+                    continue
                 render_fn = effect_info["render"]
                 params = effect_info.get("params", {})
+                # Auto-inject phase per channel so effects vary per light
+                if "phase" not in params:
+                    params = {**params, "phase": float(channel_id)}
                 r, g, b = render_fn(t, **params)
-                # hue-entertainment-pykit expects 0-255
-                streaming.set_color(light_id, r, g, b)
-            streaming.render()
-            # Sleep to maintain FPS
+                streaming.set_input((r, g, b, channel_id))
             elapsed = time.monotonic() - start_time - t
             sleep_time = interval - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
-    except Exception as e:
-        print(f"Stream error: {e}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Stream error: {exc}", file=sys.stderr)
     finally:
+        streaming.stop_stream()
         _clear_pid()
 
 
@@ -116,20 +190,13 @@ def fork_stream(
     client_key: str,
     scene_data: dict,
 ):
-    """Fork a background process to run streaming effects for a scene.
-
-    Args:
-        bridge_ip: Bridge IP address.
-        api_key: Hue API key.
-        client_key: Hue entertainment client key.
-        scene_data: Scene dict with light configs (from scene JSON).
+    """Fork a background process to run streaming effects.
 
     Returns:
-        PID of the forked process.
+        PID of the forked process, or None if no effects.
     """
     from hue.effects import get_effect
 
-    # Resolve effect render functions before forking
     light_effects: dict[int, dict] = {}
     for light_id_str, config in scene_data.get("lights", {}).items():
         if "effect" in config:
@@ -153,6 +220,5 @@ def fork_stream(
         finally:
             os._exit(0)
     else:
-        # Parent — write PID file for the child
         PID_FILE.write_text(str(pid))
         return pid

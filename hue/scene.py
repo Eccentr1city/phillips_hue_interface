@@ -90,13 +90,10 @@ def apply_scene(bridge: Bridge, name: str) -> dict:
     Returns:
         {"static": [light_ids], "streaming": [light_ids], "pid": int|None}
     """
-    from hue.stream import fork_stream, stop_stream
+    from hue.stream import start_stream, stop_stream
 
     scene = get_scene(name)
     lights_config = scene.get("lights", {})
-
-    # Kill any existing stream
-    stop_stream()
 
     static_ids = []
     effect_ids = []
@@ -135,15 +132,18 @@ def apply_scene(bridge: Bridge, name: str) -> dict:
         except KeyError:
             pass
 
-    # Fork streaming for effect lights
+    # Start/update streaming daemon for effect lights
     pid = None
     if effect_ids:
-        pid = fork_stream(
+        pid = start_stream(
             bridge.ip,
             bridge.api_key,
             bridge.client_key,
             scene,
         )
+    else:
+        # Scene is all static — stop any running stream
+        stop_stream()
 
     return {"static": static_ids, "streaming": effect_ids, "pid": pid}
 

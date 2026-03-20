@@ -1,27 +1,32 @@
-"""Streaming engine using hue-entertainment-pykit for real-time DTLS effects."""
+"""Streaming daemon — keeps a single DTLS connection and hot-swaps effects.
+
+The daemon is a long-lived subprocess that owns the DTLS entertainment session.
+To change effects, the parent writes a new config JSON and sends SIGUSR1.
+To stop, the parent sends SIGTERM. No DTLS teardown/reconnect on effect switch.
+
+Config file format (.hue_stream_config.json):
+{
+    "bridge_ip": "...",
+    "api_key": "...",
+    "client_key": "...",
+    "light_effects": {"1": {"effect": "candle", "params": {}}, ...}
+}
+"""
 
 import json
 import os
 import signal
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
 import requests
 
-PID_FILE = Path(__file__).resolve().parent.parent / ".hue_stream.pid"
-LOG_FILE = Path(__file__).resolve().parent.parent / ".hue_stream.log"
-
-
-def _write_pid():
-    PID_FILE.write_text(str(os.getpid()))
-
-
-def _clear_pid():
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+PID_FILE = PROJECT_DIR / ".hue_stream.pid"
+LOG_FILE = PROJECT_DIR / ".hue_stream.log"
+CONFIG_FILE = PROJECT_DIR / ".hue_stream_config.json"
 
 
 def _log(msg: str):
@@ -31,20 +36,23 @@ def _log(msg: str):
 
 
 def get_running_pid() -> int | None:
-    """Return the PID of the running stream process, or None."""
+    """Return the PID of the running daemon, or None."""
     if not PID_FILE.exists():
         return None
     try:
         pid = int(PID_FILE.read_text().strip())
-        os.kill(pid, 0)  # check alive
+        os.kill(pid, 0)
         return pid
     except (ValueError, ProcessLookupError, PermissionError):
-        _clear_pid()
+        try:
+            PID_FILE.unlink()
+        except FileNotFoundError:
+            pass
         return None
 
 
 def stop_stream():
-    """Kill the running stream process and wait for it to exit."""
+    """Stop the streaming daemon."""
     pid = get_running_pid()
     if pid is None:
         return False
@@ -52,54 +60,48 @@ def stop_stream():
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
-        _clear_pid()
+        try:
+            PID_FILE.unlink()
+        except FileNotFoundError:
+            pass
         return True
 
-    # Wait for the process to actually die so the bridge releases the DTLS session
-    dead = False
-    for _ in range(20):  # up to 2 seconds for graceful shutdown
+    # Wait for graceful shutdown
+    for _ in range(30):
         try:
             os.kill(pid, 0)
             time.sleep(0.1)
         except ProcessLookupError:
-            dead = True
             break
 
-    # Escalate to SIGKILL if SIGTERM wasn't enough
-    if not dead:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        for _ in range(10):  # up to 1 more second
-            try:
-                os.kill(pid, 0)
-                time.sleep(0.1)
-            except ProcessLookupError:
-                break
-
-    # Reap zombie if we're the parent
     try:
         os.waitpid(pid, os.WNOHANG)
     except ChildProcessError:
         pass
 
-    _clear_pid()
-    # Give the bridge a moment to fully release the session
-    time.sleep(2.0)
+    try:
+        PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
     return True
 
 
-def _build_light_to_channel_map(bridge_ip: str, api_key: str) -> dict[int, int]:
-    """Build a mapping from v1 light IDs to entertainment channel IDs.
+def _write_config(bridge_ip: str, api_key: str, client_key: str, light_effects: dict):
+    """Write the config JSON that the daemon reads."""
+    config_data = {
+        "bridge_ip": bridge_ip,
+        "api_key": api_key,
+        "client_key": client_key,
+        "light_effects": light_effects,
+    }
+    CONFIG_FILE.write_text(json.dumps(config_data))
 
-    Queries the v2 API to correlate entertainment services, light services,
-    and channel assignments in the entertainment configuration.
-    """
+
+def _build_light_to_channel_map(bridge_ip: str, api_key: str) -> dict[int, int]:
+    """Build a mapping from v1 light IDs to entertainment channel IDs."""
     headers = {"hue-application-key": api_key}
     base = f"https://{bridge_ip}"
 
-    # Get entertainment services: maps entertainment_rid -> v1 light id
     resp = requests.get(
         f"{base}/clip/v2/resource/entertainment",
         headers=headers,
@@ -113,7 +115,6 @@ def _build_light_to_channel_map(bridge_ip: str, api_key: str) -> dict[int, int]:
         if v1.startswith("/lights/"):
             ent_rid_to_v1[svc["id"]] = int(v1.split("/")[-1])
 
-    # Get entertainment configuration: maps channel_id -> entertainment_rid
     resp = requests.get(
         f"{base}/clip/v2/resource/entertainment_configuration",
         headers=headers,
@@ -130,8 +131,7 @@ def _build_light_to_channel_map(bridge_ip: str, api_key: str) -> dict[int, int]:
         cid = channel["channel_id"]
         members = channel.get("members", [])
         if members:
-            ent_rid = members[0]["service"]["rid"]
-            channel_to_ent_rid[cid] = ent_rid
+            channel_to_ent_rid[cid] = members[0]["service"]["rid"]
 
     light_to_channel: dict[int, int] = {}
     for cid, ent_rid in channel_to_ent_rid.items():
@@ -142,30 +142,10 @@ def _build_light_to_channel_map(bridge_ip: str, api_key: str) -> dict[int, int]:
     return light_to_channel
 
 
-def run_stream_loop(
-    bridge_ip: str,
-    api_key: str,
-    client_key: str,
-    light_effects: dict[int, dict],
-    fps: int = 25,
-):
-    """Run the DTLS streaming render loop (blocking). Called in the subprocess.
-
-    light_effects maps light ID (int) to {"effect": "name", "params": {...}}.
-    Effect render functions are resolved here in the child process.
-    """
-    import hue_entertainment_pykit as hep
-
+def _resolve_effects(light_effects: dict[int, dict]) -> dict[int, dict]:
+    """Resolve effect names to render functions."""
     from hue.effects import get_effect
 
-    _write_pid()
-    _log(f"Stream child started (pid={os.getpid()})")
-
-    # Placeholder — will be replaced with a closure once streaming object exists
-    signal.signal(signal.SIGINT, lambda s, f: os._exit(0))
-    signal.signal(signal.SIGTERM, lambda s, f: os._exit(0))
-
-    # Resolve effect names to render functions
     render_map: dict[int, dict] = {}
     for light_id, info in light_effects.items():
         eff = get_effect(info["effect"])
@@ -173,11 +153,40 @@ def run_stream_loop(
             "render": eff["render"],
             "params": info.get("params", {}),
         }
+    return render_map
 
-    # Build light ID -> channel ID mapping
+
+def run_daemon(config_path: str):
+    """Main daemon loop — connect once, hot-swap effects via SIGUSR1."""
+    import hue_entertainment_pykit as hep
+
+    PID_FILE.write_text(str(os.getpid()))
+    _log(f"Daemon started (pid={os.getpid()})")
+
+    # Load initial config
+    config_data = json.loads(Path(config_path).read_text())
+    bridge_ip = config_data["bridge_ip"]
+    api_key = config_data["api_key"]
+    client_key = config_data["client_key"]
+
+    light_effects = {
+        int(lid): info for lid, info in config_data["light_effects"].items()
+    }
+    render_map = _resolve_effects(light_effects)
+
+    # SIGUSR1 handler: reload config and swap effects (no DTLS reconnect)
+    reload_flag = [False]
+
+    def _on_reload(signum, frame):
+        reload_flag[0] = True
+
+    signal.signal(signal.SIGUSR1, _on_reload)
+
+    # Build channel map
     light_to_channel = _build_light_to_channel_map(bridge_ip, api_key)
     _log(f"Channel map: {light_to_channel}")
 
+    # Set up DTLS connection
     bridge = hep.create_bridge(
         identification="",
         rid="",
@@ -193,7 +202,7 @@ def run_stream_loop(
     configs = ent.get_entertainment_configs()
     if not configs:
         _log("ERROR: No entertainment areas configured on bridge")
-        _clear_pid()
+        PID_FILE.unlink(missing_ok=True)
         sys.exit(1)
 
     config_id = list(configs.keys())[0]
@@ -203,21 +212,21 @@ def run_stream_loop(
     streaming = hep.Streaming(bridge, ent_config, ent_conf_repo)
     streaming.set_color_space("rgb")
 
-    # Now install the real signal handler that can close the DTLS session
-    def _cleanup(signum, frame):
-        _log("Received SIGTERM, stopping stream")
-        _clear_pid()
-        # Run stop_stream in a thread with a hard timeout — it can hang
-        t = threading.Thread(target=lambda: streaming.stop_stream(), daemon=True)
-        t.start()
-        t.join(timeout=1.0)
-        _log("Stream stop attempted, exiting")
+    # SIGTERM handler: clean shutdown
+    def _on_shutdown(signum, frame):
+        _log("Received SIGTERM, shutting down")
+        try:
+            streaming.stop_stream()
+        except Exception:
+            pass
+        PID_FILE.unlink(missing_ok=True)
+        _log("Daemon stopped")
         os._exit(0)
 
-    signal.signal(signal.SIGTERM, _cleanup)
-    signal.signal(signal.SIGINT, _cleanup)
+    signal.signal(signal.SIGTERM, _on_shutdown)
+    signal.signal(signal.SIGINT, _on_shutdown)
 
-    # Retry DTLS handshake — bridge may need a moment after previous session
+    # DTLS handshake with retry
     for attempt in range(3):
         try:
             _log(f"DTLS handshake attempt {attempt + 1}")
@@ -230,14 +239,34 @@ def run_stream_loop(
                 time.sleep(2)
             else:
                 _log("DTLS handshake failed after 3 attempts, giving up")
-                _clear_pid()
+                PID_FILE.unlink(missing_ok=True)
                 sys.exit(1)
 
-    try:
-        interval = 1.0 / fps
-        start_time = time.monotonic()
+    # Render loop
+    fps = 25
+    interval = 1.0 / fps
+    start_time = time.monotonic()
 
+    try:
         while True:
+            # Check for config reload
+            if reload_flag[0]:
+                reload_flag[0] = False
+                try:
+                    new_data = json.loads(CONFIG_FILE.read_text())
+                    new_effects = {
+                        int(lid): info
+                        for lid, info in new_data["light_effects"].items()
+                    }
+                    render_map = _resolve_effects(new_effects)
+                    # Refresh channel map in case lights changed
+                    light_to_channel = _build_light_to_channel_map(
+                        bridge_ip, api_key
+                    )
+                    _log(f"Reloaded effects: {list(render_map.keys())}")
+                except Exception as exc:
+                    _log(f"Reload failed: {exc}")
+
             t = time.monotonic() - start_time
             for light_id, effect_info in render_map.items():
                 channel_id = light_to_channel.get(light_id)
@@ -245,48 +274,48 @@ def run_stream_loop(
                     continue
                 render_fn = effect_info["render"]
                 params = effect_info.get("params", {})
-                # Auto-inject phase per channel so effects vary per light
                 if "phase" not in params:
                     params = {**params, "phase": float(channel_id)}
                 r, g, b = render_fn(t, **params)
                 streaming.set_input((r, g, b, channel_id))
+
             elapsed = time.monotonic() - start_time - t
             sleep_time = interval - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
     except Exception as exc:
-        _log(f"Stream loop error: {exc}")
+        _log(f"Render loop error: {exc}")
     finally:
         try:
             streaming.stop_stream()
         except Exception:
             pass
-        _clear_pid()
-        _log("Stream child exited")
+        PID_FILE.unlink(missing_ok=True)
+        _log("Daemon exited")
 
 
-def fork_stream(
+def start_stream(
     bridge_ip: str,
     api_key: str,
     client_key: str,
     scene_data: dict,
-):
-    """Launch a background subprocess to run streaming effects.
+) -> int | None:
+    """Start or update the streaming daemon.
 
-    Uses subprocess.Popen instead of os.fork() to get a clean process,
-    avoiding inherited socket/TLS state from the parent.
+    If the daemon is already running, hot-swaps effects via SIGUSR1.
+    If not running, launches a new daemon subprocess.
 
     Returns:
-        PID of the subprocess, or None if no effects.
+        PID of the daemon, or None if no effects in scene_data.
     """
     from hue.effects import get_effect
 
-    # Validate effects exist and collect config
+    # Validate effects and collect config
     light_effects: dict[str, dict] = {}
     for light_id_str, config in scene_data.get("lights", {}).items():
         if "effect" in config:
             effect_name = config["effect"]
-            get_effect(effect_name)  # validate it exists
+            get_effect(effect_name)  # validate
             light_effects[light_id_str] = {
                 "effect": effect_name,
                 "params": config.get("params", {}),
@@ -295,23 +324,21 @@ def fork_stream(
     if not light_effects:
         return None
 
-    # Write config to a temp JSON file for the subprocess to read
-    config_data = {
-        "bridge_ip": bridge_ip,
-        "api_key": api_key,
-        "client_key": client_key,
-        "light_effects": light_effects,
-    }
-    config_file = PID_FILE.parent / ".hue_stream_config.json"
-    config_file.write_text(json.dumps(config_data))
+    # Write config file
+    _write_config(bridge_ip, api_key, client_key, light_effects)
 
-    # Find the Python interpreter in the same environment
+    # If daemon is already running, just signal it to reload
+    pid = get_running_pid()
+    if pid is not None:
+        _log(f"Signaling daemon (pid={pid}) to reload effects")
+        os.kill(pid, signal.SIGUSR1)
+        return pid
+
+    # Launch new daemon
     python = sys.executable
-
-    # Launch as a completely new process
     proc = subprocess.Popen(
-        [python, "-m", "hue.stream", str(config_file)],
-        cwd=str(PID_FILE.parent),
+        [python, "-m", "hue.stream", str(CONFIG_FILE)],
+        cwd=str(PROJECT_DIR),
         start_new_session=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -319,31 +346,16 @@ def fork_stream(
     )
 
     PID_FILE.write_text(str(proc.pid))
+    _log(f"Launched daemon (pid={proc.pid})")
     return proc.pid
 
 
+# Keep old name as alias for compatibility
+fork_stream = start_stream
+
+
 if __name__ == "__main__":
-    # Entry point for subprocess-based streaming.
-    # Usage: python -m hue.stream <config_file.json>
     if len(sys.argv) < 2:
         print("Usage: python -m hue.stream <config_file.json>", file=sys.stderr)
         sys.exit(1)
-
-    config_path = Path(sys.argv[1])
-    try:
-        config_data = json.loads(config_path.read_text())
-    except Exception as exc:
-        _log(f"Failed to read config file {config_path}: {exc}")
-        sys.exit(1)
-
-    # Parse light_effects: keys are string light IDs
-    light_effects = {
-        int(lid): info for lid, info in config_data["light_effects"].items()
-    }
-
-    run_stream_loop(
-        bridge_ip=config_data["bridge_ip"],
-        api_key=config_data["api_key"],
-        client_key=config_data["client_key"],
-        light_effects=light_effects,
-    )
+    run_daemon(sys.argv[1])

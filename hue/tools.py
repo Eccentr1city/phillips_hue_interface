@@ -248,12 +248,11 @@ async def hue_set(
     # Effect mode — start streaming effects on the target lights
     if effect is not None:
         from hue.effects import get_effect
-        from hue.stream import fork_stream, stop_stream
+        from hue.stream import start_stream
 
         get_effect(effect)  # validate it exists
-        stop_stream()
 
-        # Build a scene-like dict for fork_stream
+        # Build a scene-like dict for the streaming daemon
         scene_data = {
             "lights": {
                 str(light.id): {
@@ -263,7 +262,7 @@ async def hue_set(
                 for light in resolved
             }
         }
-        pid = fork_stream(bridge.ip, bridge.api_key, bridge.client_key, scene_data)
+        pid = start_stream(bridge.ip, bridge.api_key, bridge.client_key, scene_data)
         names = ", ".join(light.name for light in resolved)
         return f"Effect '{effect}' started on {names} (pid={pid})."
 

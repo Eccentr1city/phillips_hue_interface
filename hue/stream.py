@@ -55,12 +55,27 @@ def stop_stream():
         return True
 
     # Wait for the process to actually die so the bridge releases the DTLS session
-    for _ in range(30):  # up to 3 seconds
+    dead = False
+    for _ in range(20):  # up to 2 seconds for graceful shutdown
         try:
             os.kill(pid, 0)
             time.sleep(0.1)
         except ProcessLookupError:
+            dead = True
             break
+
+    # Escalate to SIGKILL if SIGTERM wasn't enough
+    if not dead:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        for _ in range(10):  # up to 1 more second
+            try:
+                os.kill(pid, 0)
+                time.sleep(0.1)
+            except ProcessLookupError:
+                break
 
     # Reap zombie if we're the parent
     try:
@@ -70,7 +85,7 @@ def stop_stream():
 
     _clear_pid()
     # Give the bridge a moment to fully release the session
-    time.sleep(0.5)
+    time.sleep(1.0)
     return True
 
 
@@ -146,9 +161,11 @@ def run_stream_loop(
     _log(f"Stream child started (pid={os.getpid()})")
 
     def _cleanup(signum, frame):
-        _log("Received SIGTERM, exiting")
+        _log("Received SIGTERM, exiting immediately")
         _clear_pid()
-        sys.exit(0)
+        # Use os._exit to skip finally blocks — avoids slow streaming.stop_stream()
+        # which can hold the DTLS session for seconds and block the next connection.
+        os._exit(0)
 
     signal.signal(signal.SIGTERM, _cleanup)
     signal.signal(signal.SIGINT, _cleanup)

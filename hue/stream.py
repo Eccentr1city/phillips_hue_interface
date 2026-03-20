@@ -209,89 +209,103 @@ def run_daemon(config_path: str):
     ent_config = configs[config_id]
     ent_conf_repo = ent.get_ent_conf_repo()
 
-    streaming = hep.Streaming(bridge, ent_config, ent_conf_repo)
-    streaming.set_color_space("rgb")
+    # SIGTERM handler: clean shutdown (set flag so render loop exits cleanly)
+    shutdown_flag = [False]
 
-    # SIGTERM handler: clean shutdown
     def _on_shutdown(signum, frame):
         _log("Received SIGTERM, shutting down")
-        try:
-            streaming.stop_stream()
-        except Exception:
-            pass
-        PID_FILE.unlink(missing_ok=True)
-        _log("Daemon stopped")
-        os._exit(0)
+        shutdown_flag[0] = True
 
     signal.signal(signal.SIGTERM, _on_shutdown)
     signal.signal(signal.SIGINT, _on_shutdown)
 
-    # DTLS handshake with retry
-    for attempt in range(3):
-        try:
-            _log(f"DTLS handshake attempt {attempt + 1}")
-            streaming.start_stream()
-            _log("DTLS stream started")
-            break
-        except Exception as exc:
-            _log(f"DTLS handshake failed: {exc}")
-            if attempt < 2:
-                time.sleep(2)
-            else:
-                _log("DTLS handshake failed after 3 attempts, giving up")
-                PID_FILE.unlink(missing_ok=True)
-                sys.exit(1)
-
-    # Render loop
+    # Outer loop: auto-reconnect on DTLS errors (bridge reboot, network blip, etc.)
     fps = 25
     interval = 1.0 / fps
-    start_time = time.monotonic()
 
-    try:
-        while True:
-            # Check for config reload
-            if reload_flag[0]:
-                reload_flag[0] = False
-                try:
-                    new_data = json.loads(CONFIG_FILE.read_text())
-                    new_effects = {
-                        int(lid): info
-                        for lid, info in new_data["light_effects"].items()
-                    }
-                    render_map = _resolve_effects(new_effects)
-                    # Refresh channel map in case lights changed
-                    light_to_channel = _build_light_to_channel_map(
-                        bridge_ip, api_key
-                    )
-                    _log(f"Reloaded effects: {list(render_map.keys())}")
-                except Exception as exc:
-                    _log(f"Reload failed: {exc}")
+    while not shutdown_flag[0]:
+        streaming = hep.Streaming(bridge, ent_config, ent_conf_repo)
+        streaming.set_color_space("rgb")
 
-            t = time.monotonic() - start_time
-            for light_id, effect_info in render_map.items():
-                channel_id = light_to_channel.get(light_id)
-                if channel_id is None:
-                    continue
-                render_fn = effect_info["render"]
-                params = effect_info.get("params", {})
-                if "phase" not in params:
-                    params = {**params, "phase": float(channel_id)}
-                r, g, b = render_fn(t, **params)
-                streaming.set_input((r, g, b, channel_id))
+        # DTLS handshake with retry
+        connected = False
+        for attempt in range(5):
+            if shutdown_flag[0]:
+                break
+            try:
+                _log(f"DTLS handshake attempt {attempt + 1}")
+                streaming.start_stream()
+                _log("DTLS stream started")
+                connected = True
+                break
+            except Exception as exc:
+                _log(f"DTLS handshake failed: {exc}")
+                if attempt < 4:
+                    time.sleep(3)
 
-            elapsed = time.monotonic() - start_time - t
-            sleep_time = interval - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-    except Exception as exc:
-        _log(f"Render loop error: {exc}")
-    finally:
+        if not connected:
+            if shutdown_flag[0]:
+                break
+            _log("DTLS handshake failed after 5 attempts, retrying in 10s")
+            time.sleep(10)
+            continue
+
+        # Render loop — runs until error or shutdown
+        start_time = time.monotonic()
+        try:
+            while not shutdown_flag[0]:
+                # Check for config reload
+                if reload_flag[0]:
+                    reload_flag[0] = False
+                    try:
+                        new_data = json.loads(CONFIG_FILE.read_text())
+                        new_effects = {
+                            int(lid): info
+                            for lid, info in new_data["light_effects"].items()
+                        }
+                        render_map = _resolve_effects(new_effects)
+                        light_to_channel = _build_light_to_channel_map(
+                            bridge_ip, api_key
+                        )
+                        _log(f"Reloaded effects: {list(render_map.keys())}")
+                    except Exception as exc:
+                        _log(f"Reload failed: {exc}")
+
+                t = time.monotonic() - start_time
+                for light_id, effect_info in render_map.items():
+                    channel_id = light_to_channel.get(light_id)
+                    if channel_id is None:
+                        continue
+                    render_fn = effect_info["render"]
+                    params = effect_info.get("params", {})
+                    if "phase" not in params:
+                        params = {**params, "phase": float(channel_id)}
+                    r, g, b = render_fn(t, **params)
+                    streaming.set_input((r, g, b, channel_id))
+
+                elapsed = time.monotonic() - start_time - t
+                sleep_time = interval - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+        except Exception as exc:
+            _log(f"Render loop error: {exc}, will reconnect")
+
         try:
             streaming.stop_stream()
         except Exception:
             pass
-        PID_FILE.unlink(missing_ok=True)
-        _log("Daemon exited")
+
+        if not shutdown_flag[0]:
+            _log("Reconnecting in 3s...")
+            time.sleep(3)
+
+    # Clean shutdown
+    try:
+        streaming.stop_stream()
+    except Exception:
+        pass
+    PID_FILE.unlink(missing_ok=True)
+    _log("Daemon stopped")
 
 
 def start_stream(

@@ -110,14 +110,13 @@ def _cmd_set(args: list[str]):
 
     if effect_name:
         from hue.effects import get_effect
-        from hue.stream import fork_stream, stop_stream
+        from hue.stream import start_stream
 
         get_effect(effect_name)  # validate
-        stop_stream()
         scene_data = {
             "lights": {str(lt.id): {"effect": effect_name} for lt in resolved}
         }
-        pid = fork_stream(bridge.ip, bridge.api_key, bridge.client_key, scene_data)
+        pid = start_stream(bridge.ip, bridge.api_key, bridge.client_key, scene_data)
         names = ", ".join(lt.name for lt in resolved)
         print(f"Effect '{effect_name}' started on {names} (pid={pid})")
     else:

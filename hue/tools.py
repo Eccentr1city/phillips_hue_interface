@@ -17,8 +17,9 @@ TOOL_DEFINITIONS = [
     {
         "name": "hue_status",
         "description": (
-            "Get the current state of all Hue lights and bridge info. "
-            "Returns each light's name, on/off, brightness, color, and reachability."
+            "Check what the lights are doing right now. "
+            "Returns every light's name, ID, on/off, brightness, color, and reachability, "
+            "plus bridge info. Use this before changing lights if you need to know current state."
         ),
         "input_schema": {
             "type": "object",
@@ -29,10 +30,17 @@ TOOL_DEFINITIONS = [
     {
         "name": "hue_set",
         "description": (
-            "Control Hue lights. Set color, brightness, on/off, or start an effect. "
-            "Can also apply a saved scene by name. "
-            "Colors: red, orange, yellow, green, cyan, blue, purple, pink, white, "
-            "warm white, cool white, or hex (#RRGGBB). Brightness: 0.0-1.0."
+            "The main light control tool — handles everything in one call. Examples:\n"
+            '  All lights red: {lights: "all", color: "red"}\n'
+            "  Dim one light: {lights: 1, brightness: 0.3}\n"
+            '  Turn off by name: {lights: "Cylinder lamp", on: false}\n'
+            '  Fire effect: {lights: "all", effect: "candle"}\n'
+            '  Apply a scene: {scene: "cozy"}\n'
+            "Setting color or brightness implicitly turns the light on. "
+            "Colors: red, orange, yellow, green, cyan, blue, purple, pink, "
+            "white, warm white, cool white, or hex (#RRGGBB). "
+            "Effects run as real-time DTLS streaming at 25fps. "
+            "Use hue_list to see available effects and scenes."
         ),
         "input_schema": {
             "type": "object",
@@ -41,32 +49,36 @@ TOOL_DEFINITIONS = [
                     "description": (
                         "Which lights to control. "
                         'Light ID (int), name (string), "all", '
-                        "or a list of IDs/names. Not needed if setting a scene."
+                        "or a list of IDs/names. Required unless using scene."
                     ),
                 },
                 "color": {
                     "type": "string",
-                    "description": "Color name or hex (#RRGGBB).",
+                    "description": "Color name (e.g. 'red', 'warm white') or hex (#RRGGBB).",
                 },
                 "brightness": {
                     "type": "number",
-                    "description": "Brightness 0.0-1.0.",
+                    "description": "Brightness 0.0 (dimmest) to 1.0 (full).",
                 },
                 "on": {
                     "type": "boolean",
-                    "description": "Turn on/off.",
+                    "description": "Turn on (true) or off (false). Implied by color/brightness.",
                 },
                 "effect": {
                     "type": "string",
-                    "description": "Start a named effect (e.g. 'candle', 'breathe').",
+                    "description": (
+                        "Start a streaming effect by name. "
+                        "Built-in: 'candle' (realistic fire flicker), 'breathe' (slow color fade). "
+                        "Stops any previously running effect."
+                    ),
                 },
                 "effect_params": {
                     "type": "object",
-                    "description": "Parameters to pass to the effect's render function.",
+                    "description": "Optional params for the effect (e.g. {speed: 0.5}).",
                 },
                 "scene": {
                     "type": "string",
-                    "description": "Apply a saved scene by name (ignores other params).",
+                    "description": "Apply a saved scene by name. Ignores all other params.",
                 },
             },
             "required": [],
@@ -74,7 +86,10 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "hue_stop",
-        "description": "Stop any running streaming effects.",
+        "description": (
+            "Stop any running streaming effect (candle, breathe, etc.) and kill the "
+            "background process. Lights will hold their last color. No-op if nothing is running."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {},
@@ -83,7 +98,10 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "hue_list",
-        "description": "List available effects and saved scenes.",
+        "description": (
+            "List all available effects (built-in + user-created) and saved scenes. "
+            "Use this to check what's available before calling hue_set with effect or scene."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {},
@@ -93,20 +111,26 @@ TOOL_DEFINITIONS = [
     {
         "name": "hue_define_effect",
         "description": (
-            "Create a new lighting effect by writing a Python file. "
-            "Must define: render(t, **params) -> (r, g, b) "
-            "where t is elapsed seconds and rgb are 0-255."
+            "Create a new custom streaming effect. Write a Python file that defines "
+            "render(t, **params) -> (r, g, b) where t is elapsed seconds and rgb are 0-255. "
+            "The effect runs at 25fps via DTLS streaming. Each light gets a unique 'phase' "
+            "param automatically so they vary independently. After creating, use it with "
+            'hue_set: {lights: "all", effect: "your_effect_name"}'
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Effect name (e.g. 'lava', 'campfire').",
+                    "description": "Effect name — becomes the filename and the name used in hue_set.",
                 },
                 "code": {
                     "type": "string",
-                    "description": "Python source code with a render(t, **params) function.",
+                    "description": (
+                        "Python source code. Must define: render(t, **params) -> (r, g, b). "
+                        "Can use math, random, time from stdlib. "
+                        "The 'phase' param differentiates lights."
+                    ),
                 },
             },
             "required": ["name", "code"],
@@ -115,27 +139,32 @@ TOOL_DEFINITIONS = [
     {
         "name": "hue_define_scene",
         "description": (
-            "Save a scene. Either provide an explicit lights config, "
-            "or set from_current=true to snapshot whatever the lights are doing right now."
+            "Save a lighting scene for quick recall later. Two modes:\n"
+            "  Snapshot current: {name: 'cozy', from_current: true} — saves whatever "
+            "the lights are doing right now.\n"
+            '  Explicit config: {name: "movie", lights: {"1": {color: "blue", brightness: 0.3}, '
+            '"2": {color: "purple"}}} — define exactly what each light should do.\n'
+            "Light configs can include: color, brightness (0-1), effect (name), params. "
+            "Apply saved scenes with hue_set: {scene: 'cozy'}"
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Scene name (e.g. 'cozy', 'movie').",
+                    "description": "Scene name for saving and recalling.",
                 },
                 "lights": {
                     "type": "object",
                     "description": (
-                        "Mapping of light ID (string) to config. Each config can have: "
-                        "color, brightness (0-1), effect (name), params (effect params). "
+                        "Mapping of light ID (string) to config object. "
+                        "Each config: {color, brightness, effect, params}. "
                         "Not needed if from_current is true."
                     ),
                 },
                 "from_current": {
                     "type": "boolean",
-                    "description": "If true, snapshot the current state of all lights as the scene.",
+                    "description": "Snapshot the current state of all lights as the scene.",
                 },
             },
             "required": ["name"],

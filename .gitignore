@@ -5,3 +5,4 @@ __pycache__/
 .python-version
 .hue_stream.pid
 .hue_stream.log
+.hue_stream_config.json

@@ -1,10 +1,11 @@
 """Streaming engine using hue-entertainment-pykit for real-time DTLS effects."""
 
+import json
 import os
 import signal
+import subprocess
 import sys
 import time
-import traceback
 from pathlib import Path
 
 import requests
@@ -132,8 +133,14 @@ def run_stream_loop(
     light_effects: dict[int, dict],
     fps: int = 25,
 ):
-    """Run the DTLS streaming render loop (blocking). Called in the forked subprocess."""
+    """Run the DTLS streaming render loop (blocking). Called in the subprocess.
+
+    light_effects maps light ID (int) to {"effect": "name", "params": {...}}.
+    Effect render functions are resolved here in the child process.
+    """
     import hue_entertainment_pykit as hep
+
+    from hue.effects import get_effect
 
     _write_pid()
     _log(f"Stream child started (pid={os.getpid()})")
@@ -145,6 +152,15 @@ def run_stream_loop(
 
     signal.signal(signal.SIGTERM, _cleanup)
     signal.signal(signal.SIGINT, _cleanup)
+
+    # Resolve effect names to render functions
+    render_map: dict[int, dict] = {}
+    for light_id, info in light_effects.items():
+        eff = get_effect(info["effect"])
+        render_map[light_id] = {
+            "render": eff["render"],
+            "params": info.get("params", {}),
+        }
 
     # Build light ID -> channel ID mapping
     light_to_channel = _build_light_to_channel_map(bridge_ip, api_key)
@@ -197,7 +213,7 @@ def run_stream_loop(
 
         while True:
             t = time.monotonic() - start_time
-            for light_id, effect_info in light_effects.items():
+            for light_id, effect_info in render_map.items():
                 channel_id = light_to_channel.get(light_id)
                 if channel_id is None:
                     continue
@@ -229,39 +245,79 @@ def fork_stream(
     client_key: str,
     scene_data: dict,
 ):
-    """Fork a background process to run streaming effects.
+    """Launch a background subprocess to run streaming effects.
+
+    Uses subprocess.Popen instead of os.fork() to get a clean process,
+    avoiding inherited socket/TLS state from the parent.
 
     Returns:
-        PID of the forked process, or None if no effects.
+        PID of the subprocess, or None if no effects.
     """
     from hue.effects import get_effect
 
-    light_effects: dict[int, dict] = {}
+    # Validate effects exist and collect config
+    light_effects: dict[str, dict] = {}
     for light_id_str, config in scene_data.get("lights", {}).items():
         if "effect" in config:
             effect_name = config["effect"]
-            eff = get_effect(effect_name)
-            light_effects[int(light_id_str)] = {
-                "render": eff["render"],
+            get_effect(effect_name)  # validate it exists
+            light_effects[light_id_str] = {
+                "effect": effect_name,
                 "params": config.get("params", {}),
             }
 
     if not light_effects:
         return None
 
-    # Ignore SIGCHLD so forked children don't become zombies
-    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    # Write config to a temp JSON file for the subprocess to read
+    config_data = {
+        "bridge_ip": bridge_ip,
+        "api_key": api_key,
+        "client_key": client_key,
+        "light_effects": light_effects,
+    }
+    config_file = PID_FILE.parent / ".hue_stream_config.json"
+    config_file.write_text(json.dumps(config_data))
 
-    pid = os.fork()
-    if pid == 0:
-        # Child process — detach from parent
-        try:
-            os.setsid()
-            run_stream_loop(bridge_ip, api_key, client_key, light_effects)
-        except Exception:
-            _log(f"Fork child exception: {traceback.format_exc()}")
-        finally:
-            os._exit(0)
-    else:
-        PID_FILE.write_text(str(pid))
-        return pid
+    # Find the Python interpreter in the same environment
+    python = sys.executable
+
+    # Launch as a completely new process
+    proc = subprocess.Popen(
+        [python, "-m", "hue.stream", str(config_file)],
+        cwd=str(PID_FILE.parent),
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+    )
+
+    PID_FILE.write_text(str(proc.pid))
+    return proc.pid
+
+
+if __name__ == "__main__":
+    # Entry point for subprocess-based streaming.
+    # Usage: python -m hue.stream <config_file.json>
+    if len(sys.argv) < 2:
+        print("Usage: python -m hue.stream <config_file.json>", file=sys.stderr)
+        sys.exit(1)
+
+    config_path = Path(sys.argv[1])
+    try:
+        config_data = json.loads(config_path.read_text())
+    except Exception as exc:
+        _log(f"Failed to read config file {config_path}: {exc}")
+        sys.exit(1)
+
+    # Parse light_effects: keys are string light IDs
+    light_effects = {
+        int(lid): info for lid, info in config_data["light_effects"].items()
+    }
+
+    run_stream_loop(
+        bridge_ip=config_data["bridge_ip"],
+        api_key=config_data["api_key"],
+        client_key=config_data["client_key"],
+        light_effects=light_effects,
+    )

@@ -1,6 +1,6 @@
 # Philips Hue Interface
 
-A Python library for controlling Philips Hue lights, with support for real-time streaming effects via DTLS. Designed as the lighting backend for [Hob](https://github.com/Eccentr1city/hob), a Claude-based home assistant.
+A Python library for controlling Philips Hue lights, with support for real-time streaming effects via DTLS. Designed as a lighting backend for a Claude-based home assistant.
 
 ## Setup
 
@@ -52,9 +52,9 @@ uv run hue scene set cozy                  # restore a saved scene
 uv run hue stop                            # stop streaming effects
 ```
 
-### Hob integration
+### Claude assistant integration
 
-The library exports `TOOL_DEFINITIONS` and `TOOL_FUNCTIONS` from `hue.tools` for Claude tool-calling. Hob's `hue_tools.py` imports these:
+The library exports `TOOL_DEFINITIONS` and `TOOL_FUNCTIONS` from `hue.tools` for Claude tool-calling. The assistant's `hue_tools.py` imports these:
 
 ```python
 import sys
@@ -72,7 +72,7 @@ Effects are Python files that define a `render(t, **params) -> (r, g, b)` functi
 - `candle` -- realistic fire flicker with layered noise
 - `breathe` -- slow color breathing
 
-**User-defined effects** are created by Hob via `hue_define_effect` and saved to `effects/`. Hob can invent arbitrary effects on the fly.
+**User-defined effects** are created by the home assistant via `hue_define_effect` and saved to `effects/`. The assistant can invent arbitrary effects on the fly.
 
 ### Example effect
 
@@ -157,7 +157,7 @@ phillips_hue_interface/
     __init__.py         # Exports Bridge
     bridge.py           # Bridge connection, REST API, light discovery
     light.py            # Light model: .set(), .on(), .off(), color resolution
-    tools.py            # Hob tool definitions (TOOL_DEFINITIONS + TOOL_FUNCTIONS)
+    tools.py            # Tool definitions (TOOL_DEFINITIONS + TOOL_FUNCTIONS)
     scene.py            # Scene save/load/apply
     stream.py           # Streaming daemon (DTLS, hot-reload, auto-reconnect)
     cli.py              # CLI entry point
@@ -165,6 +165,6 @@ phillips_hue_interface/
       __init__.py       # Effect loader (discovers built-in + user effects)
       candle.py         # Built-in: fire flicker
       breathe.py        # Built-in: color breathing
-  effects/              # User-defined effects (created by Hob)
+  effects/              # User-defined effects
   scenes/               # Saved scenes (JSON)
 ```

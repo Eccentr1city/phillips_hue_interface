@@ -33,6 +33,12 @@ import requests
 # than bulb resolution being the cause of stepping.
 DITHER = 0.0
 
+# Send each frame's packet this many times. Streaming is unreliable UDP; sending
+# a duplicate guards against packet loss (the bridge just applies the latest, so
+# duplicates are harmless). Diagnostics showed ~0% loss but high latency jitter
+# on Wi-Fi, so this is cheap insurance more than a fix. Set to 1 to disable.
+SEND_REDUNDANCY = 2
+
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 PID_FILE = PROJECT_DIR / ".hue_stream.pid"
 LOG_FILE = PROJECT_DIR / ".hue_stream.log"
@@ -239,7 +245,9 @@ def _send_frame(streaming, frame: list[tuple[int, float, float, float]]):
     for channel_id, r, g, b in frame:
         channel_data += struct.pack(">BHHH", channel_id, _u16(r), _u16(g), _u16(b))
     message = svc._build_message(channel_data)
-    svc._dtls_service.get_socket().send(message)
+    sock = svc._dtls_service.get_socket()
+    for _ in range(SEND_REDUNDANCY):
+        sock.send(message)
     svc._last_message = message
 
 

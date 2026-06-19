@@ -71,6 +71,13 @@ tracks the pulse, flavor lights add faster higher-frequency accents. It's a
 loopback (not a mic), so it's immune to room noise and works with headphones, as
 long as audio routes through the Mac. See `hue/audiosync.py` for BlackHole setup.
 
+Beat detection: by default it uses librosa's DP beat tracker (installs on 3.13).
+For the SOTA tracker (madmom's RNN+DBN, which only runs on Python <=3.9), run
+`uv run python -m hue beatsetup` once — it builds an isolated `.beatenv` (3.9 +
+madmom) and `beatsync` then drives the anchor from a `beat_sidecar.py` process
+that streams tempo/phase over local UDP. Falls back to librosa if `.beatenv` is
+absent.
+
 Effect params pass through as flags: `--effect wave --smooth --speed 0.3 --width 0.6`.
 Smooth mode also takes `--interval` and `--transition` (seconds).
 

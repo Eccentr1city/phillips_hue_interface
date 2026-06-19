@@ -23,9 +23,13 @@ Usage:
 """
 
 import collections
+import json
+import socket
+import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import requests
@@ -35,6 +39,11 @@ from dotenv import dotenv_values
 from hue.stream import _build_channel_maps, _send_frame
 
 requests.packages.urllib3.disable_warnings()
+
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+# Isolated Python 3.9 env + standalone script for the madmom SOTA beat tracker.
+BEATENV_PY = PROJECT_DIR / ".beatenv" / "bin" / "python"
+SIDECAR = PROJECT_DIR / "beat_sidecar.py"
 
 BLOCKSIZE = 1024
 FLAVOR_BAND = (1500, 7000)
@@ -277,6 +286,96 @@ class BeatTracker:
         return (now - self.beat_ref) % self.period
 
 
+class SidecarBeatTracker:
+    """Beat source backed by the madmom sidecar (isolated Python 3.9 process).
+
+    Launches beat_sidecar.py in .beatenv, which captures the same loopback device
+    and streams {bpm, since} over UDP. We phase-lock a grid from those packets
+    (same interface as BeatTracker) and predict beats between updates. `push` is a
+    no-op — the sidecar does its own audio capture.
+    """
+
+    def __init__(self, device, port=9099):
+        self.device = device
+        self.port = port
+        self.period = None
+        self.beat_ref = 0.0
+        self.bpm = 0.0
+        self.ready = False
+        self._stop = threading.Event()
+        self._thread = None
+        self._proc = None
+        self._sock = None
+
+    def push(self, mono, now):
+        pass
+
+    def start(self):
+        self._stop.clear()
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.bind(("127.0.0.1", self.port))
+        self._sock.settimeout(0.5)
+        args = [str(BEATENV_PY), str(SIDECAR), "--port", str(self.port)]
+        if self.device not in (None, ""):
+            args += ["--device", str(self.device)]
+        self._proc = subprocess.Popen(
+            args,
+            cwd=str(PROJECT_DIR),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._thread = threading.Thread(target=self._listen, daemon=True)
+        self._thread.start()
+
+    def _listen(self):
+        while not self._stop.is_set():
+            try:
+                data, _ = self._sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                msg = json.loads(data.decode())
+                bpm = float(msg["bpm"])
+                since = float(msg["since"])
+            except (ValueError, KeyError):
+                continue
+            if bpm <= 0:
+                continue
+            now = time.monotonic()
+            period = 60.0 / bpm
+            beat = now - since
+            if self.period is None:
+                self.period, self.beat_ref = period, beat
+            else:
+                self.period = 0.7 * self.period + 0.3 * period
+                err = (beat - self.beat_ref) % self.period
+                if err > self.period / 2:
+                    err -= self.period
+                self.beat_ref += 0.5 * err
+            self.bpm = 60.0 / self.period
+            self.ready = True
+
+    def stop(self):
+        self._stop.set()
+        if self._proc:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        if self._sock:
+            self._sock.close()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def seconds_since_beat(self, now):
+        if not self.ready or not self.period:
+            return None
+        return (now - self.beat_ref) % self.period
+
+
 def _connect(ip, api_key, client_key, stop_event=None):
     import hue_entertainment_pykit as hep
 
@@ -389,7 +488,11 @@ class BeatSyncEngine:
         flav = BandOnset(
             samplerate, *FLAVOR_BAND, FLAVOR_SENSITIVITY, FLAVOR_REFRACTORY, p["floor"]
         )
-        tracker = BeatTracker(samplerate)
+        # Prefer the madmom sidecar (SOTA) if its env is built; else librosa.
+        if BEATENV_PY.exists() and SIDECAR.exists():
+            tracker = SidecarBeatTracker(device=device)
+        else:
+            tracker = BeatTracker(samplerate)
         self._tracker = tracker
         tracker.start()
 

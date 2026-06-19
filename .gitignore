@@ -12,3 +12,6 @@ positions.json
 .hue_smooth.pid
 .hue_smooth.log
 .hue_smooth_config.json
+
+# madmom beat-tracking sidecar env (built by `hue beatsetup`)
+.beatenv/

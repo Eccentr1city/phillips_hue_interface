@@ -28,6 +28,8 @@ def main():
         _cmd_beatsync(args[1:])
     elif cmd == "ui":
         _cmd_ui(args[1:])
+    elif cmd == "beatsetup":
+        _cmd_beatsetup()
     else:
         print(f"Unknown command: {cmd}")
         _print_help()
@@ -59,6 +61,7 @@ def _print_help():
         "(loopback capture; --sensitivity/--decay/--flavor tunable)"
     )
     print("  ui [--port 8765]                Web control panel with live sliders")
+    print("  beatsetup                       Build madmom beat-tracking env (.beatenv)")
     print()
     print("Lights: ID number, light name, 'all', or comma-separated list")
 
@@ -294,6 +297,33 @@ def _cmd_ui(args: list[str]):
 
     flags = _parse_flags(args)
     serve(port=int(flags.get("port", 8765)))
+
+
+def _cmd_beatsetup():
+    """Build the isolated Python 3.9 env (.beatenv) with the madmom beat tracker."""
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    env = root / ".beatenv"
+    py = str(env / "bin" / "python")
+    print("Building .beatenv (Python 3.9 + madmom). Takes a minute...")
+    steps = [
+        ["uv", "venv", "--python", "3.9", str(env)],
+        # build deps first so madmom builds with --no-build-isolation; pin
+        # setuptools<81 (still ships pkg_resources, which madmom imports).
+        ["uv", "pip", "install", "--python", py, "cython<3", "numpy<1.24",
+         "scipy", "setuptools<81", "wheel", "sounddevice"],
+        ["uv", "pip", "install", "--python", py, "--no-build-isolation", "madmom"],
+    ]
+    for cmd in steps:
+        if subprocess.run(cmd, cwd=str(root)).returncode != 0:
+            print("beatsetup failed.")
+            sys.exit(1)
+    ok = subprocess.run(
+        [py, "-c", "import madmom; print('madmom', madmom.__version__)"], cwd=str(root)
+    ).returncode == 0
+    print("beatsetup done — beatsync will now use madmom." if ok else "verify failed.")
 
 
 def _cmd_stop():

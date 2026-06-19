@@ -288,6 +288,7 @@ def _cmd_beatsync(args: list[str]):
         max_bright=float(flags.get("max-bright", 0.22)),
         flavor_max=float(flags.get("flavor-max", 0.10)),
         downbeat_emphasis=float(flags.get("downbeat-emphasis", 0.5)),
+        lead=float(flags.get("lead", 0.06)),
         gain=float(flags.get("gain", 0.0)),
         floor=float(flags.get("floor", 0.04)),
     )

@@ -65,6 +65,7 @@ DEFAULTS = {
     "flavor_max": 0.10,
     "flavor_sensitivity": 1.5,
     "downbeat_emphasis": 0.5,  # how much weaker non-downbeats are vs the "1"
+    "lead": 0.06,  # seconds to fire early, compensating capture+output latency
     "gain": 0.0,
     # Fallback energy-follow tuning (used only before the beat grid locks);
     # not exposed in the UI. sensitivity/refractory are set above.
@@ -82,6 +83,7 @@ PARAMS = [
     {"name": "attack", "label": "Beat attack (s)", "min": 0.02, "max": 0.5, "step": 0.01},
     {"name": "decay", "label": "Beat sustain (s)", "min": 0.05, "max": 1.0, "step": 0.01},
     {"name": "downbeat_emphasis", "label": "Downbeat accent", "min": 0.0, "max": 0.9, "step": 0.05},
+    {"name": "lead", "label": "Latency comp (s)", "min": 0.0, "max": 0.3, "step": 0.01},
     {"name": "flavor_sensitivity", "label": "Flavor sensitivity", "min": 1.05, "max": 3.0, "step": 0.05},
     {"name": "gain", "label": "Loudness glow", "min": 0.0, "max": 5.0, "step": 0.1},
     {"name": "color", "label": "Anchor color", "type": "color"},
@@ -567,8 +569,9 @@ class BeatSyncEngine:
                 # energy-follow before the grid has locked — not during quiet
                 # bars, which would feel random.
                 if tracker.ready:
-                    tsb = tracker.seconds_since_beat(now)
-                    pos = tracker.current_pos(now)
+                    look = now + p["lead"]  # fire slightly early to hide latency
+                    tsb = tracker.seconds_since_beat(look)
+                    pos = tracker.current_pos(look)
                     amp = 1.0 if pos in (None, 1) else (1.0 - p["downbeat_emphasis"])
                     target = amp * float(np.exp(-tsb / max(0.05, p["decay"])))
                 else:

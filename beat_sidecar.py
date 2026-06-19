@@ -42,7 +42,7 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument("--port", type=int, default=9099)
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--window", type=float, default=6.0)
+    ap.add_argument("--window", type=float, default=12.0)
     ap.add_argument("--interval", type=float, default=0.5)
     args = ap.parse_args()
 
@@ -80,7 +80,10 @@ def main():
             state["last_t"] = now
 
     rnn = RNNDownBeatProcessor()
-    dbn = DBNDownBeatTrackingProcessor(beats_per_bar=[3, 4], fps=100)
+    # Constrain tempo to a musical range so it doesn't lock to double/half time.
+    dbn = DBNDownBeatTrackingProcessor(
+        beats_per_bar=[3, 4], min_bpm=60, max_bpm=150, fps=100
+    )
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     stream = sd.InputStream(
@@ -116,18 +119,25 @@ def main():
             if len(beats) < 2:
                 continue
             times = beats[:, 0]
+            positions = beats[:, 1]
             period = float(np.median(np.diff(times)))
             if period <= 0:
                 continue
-            # Age of the last detected beat as of NOW — includes the analysis
-            # time, so the main lands the grid on the beat rather than lagging by
-            # however long madmom took to run.
-            age = (time.monotonic() - tlast) + (dur - float(times[-1]))
+            # Anchor to an INTERIOR beat, not the edge: the last beat near the
+            # buffer's end is unreliable (the RNN/DBN has no future context
+            # there), which jitters the phase. Use the latest beat that's at
+            # least `margin` before the end, then the main extrapolates forward.
+            margin = 0.4
+            interior = np.where(times <= dur - margin)[0]
+            idx = int(interior[-1]) if len(interior) else len(times) - 1
+            # Age of that reference beat as of NOW (includes analysis time), so
+            # the main lands the grid correctly rather than lagging.
+            age = (time.monotonic() - tlast) + (dur - float(times[idx]))
             msg = {
                 "period": round(period, 5),
                 "age": round(age, 4),
-                "pos": int(beats[-1, 1]),
-                "bpb": int(beats[:, 1].max()),
+                "pos": int(positions[idx]),
+                "bpb": int(positions.max()),
             }
             sock.sendto(json.dumps(msg).encode(), (args.host, args.port))
 

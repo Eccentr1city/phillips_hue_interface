@@ -27,10 +27,11 @@ from pathlib import Path
 import requests
 
 # Temporal-dither depth, in 16-bit color units. Adds a small triangular-PDF
-# noise (about +/- one 8-bit level) before quantization so the bulb's coarse
-# brightness levels get averaged out by the eye across frames — this is what
-# removes visible stepping on slow fades. Set to 0 to disable dithering.
-DITHER = 256.0
+# noise before quantization to average out the bulb's coarse brightness levels
+# across frames. Disabled (0): in practice it read as visual jitter rather than
+# smoothing, which points at the entertainment path (no interpolation) rather
+# than bulb resolution being the cause of stepping.
+DITHER = 0.0
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 PID_FILE = PROJECT_DIR / ".hue_stream.pid"

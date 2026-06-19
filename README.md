@@ -51,7 +51,25 @@ uv run python -m hue list                            # list effects and scenes
 uv run python -m hue scene save cozy                 # snapshot current state
 uv run python -m hue scene set cozy                  # restore a saved scene
 uv run python -m hue stop                            # stop any running effect
+uv run python -m hue beatsync --device BlackHole     # sync lights to live audio
+uv run python -m hue ui                              # web control panel (live sliders)
 ```
+
+### Web control panel
+
+`uv run python -m hue ui` serves a local page (default http://127.0.0.1:8765)
+with sliders for every parameterized program. Effects hot-reload as you drag;
+beatsync updates its live engine in real time. Each effect declares its tunable
+params via a module-level `PARAMS` list (defaults come from the `render()`
+signature), so new effects show up in the UI automatically.
+
+### Beat-sync (music → lights)
+
+`hue beatsync` taps a digital audio **loopback** (e.g. BlackHole) and drives the
+lights from two bands: anchor lights ride the deep bass with a smooth swell that
+tracks the pulse, flavor lights add faster higher-frequency accents. It's a
+loopback (not a mic), so it's immune to room noise and works with headphones, as
+long as audio routes through the Mac. See `hue/audiosync.py` for BlackHole setup.
 
 Effect params pass through as flags: `--effect wave --smooth --speed 0.3 --width 0.6`.
 Smooth mode also takes `--interval` and `--transition` (seconds).

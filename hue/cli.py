@@ -26,6 +26,8 @@ def main():
         _cmd_stop()
     elif cmd == "beatsync":
         _cmd_beatsync(args[1:])
+    elif cmd == "ui":
+        _cmd_ui(args[1:])
     else:
         print(f"Unknown command: {cmd}")
         _print_help()
@@ -54,8 +56,9 @@ def _print_help():
     print("  stop                            Stop streaming effects")
     print(
         "  beatsync [--list] [--device <n>]    Sync lights to live audio "
-        "(loopback capture; --sensitivity/--gain/--decay tunable)"
+        "(loopback capture; --sensitivity/--decay/--flavor tunable)"
     )
+    print("  ui [--port 8765]                Web control panel with live sliders")
     print()
     print("Lights: ID number, light name, 'all', or comma-separated list")
 
@@ -284,6 +287,13 @@ def _cmd_beatsync(args: list[str]):
         gain=float(flags.get("gain", 0.0)),
         floor=float(flags.get("floor", 0.04)),
     )
+
+
+def _cmd_ui(args: list[str]):
+    from hue.webui import serve
+
+    flags = _parse_flags(args)
+    serve(port=int(flags.get("port", 8765)))
 
 
 def _cmd_stop():

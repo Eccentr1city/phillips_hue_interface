@@ -3,34 +3,28 @@
 Captures a digital audio loopback (e.g. BlackHole) and drives the lights from
 two frequency bands at once:
 
-- ANCHOR lights ride the deep-bass/kick band with a slow, smooth swell — the
-  steady heartbeat of the room.
-- FLAVOR lights ride a higher band (mids/highs) with a faster, twitchier
-  response and their own color — accents layered on top.
+- ANCHOR lights ride the deep-bass/kick band with a slow, smooth swell that
+  tracks the fundamental pulse (continuous energy-vs-recent-average strength).
+- FLAVOR lights ride a higher band (mids/highs) with faster accents in their
+  own color, capped dimmer so they sit under the bass.
 
-This is a loopback tap of whatever the Mac is playing (Spotify, a soft-synth /
-MIDI keyboard, a browser) — NOT a microphone, so it's immune to room noise and
-works with headphones, as long as the audio routes through the Mac.
+Loopback tap (NOT a microphone): immune to room noise, works with headphones,
+as long as audio routes through the Mac. Setup: install BlackHole, make a
+Multi-Output Device (your output + BlackHole), select it as system output.
 
-Setup (macOS): install BlackHole, then in Audio MIDI Setup create a
-"Multi-Output Device" containing both your headphones/speakers AND BlackHole,
-and select it as the system output. Run `hue beatsync --list` to find the
-BlackHole input device.
+The BeatSyncEngine runs the capture + render loop in a background thread and
+accepts live parameter updates (used by the web UI). `run()` is the CLI wrapper.
 
 Usage:
     hue beatsync --list
     hue beatsync [--device <name>] [--color red] [--flavor-color amber]
                  [--flavor "Wall closet,Wall right"] [--max-bright 0.22]
-                 [--flavor-max 0.10] [--min-bright 0.04] [--attack 0.10]
-                 [--decay 0.35] [--gain 0]
-
-    Anchor (bass) brightness rises with --max-bright using a fast --attack /
-    slow --decay swell; flavor accents are capped by --flavor-max (keep it
-    below --max-bright so they sit under the bass).
+                 [--flavor-max 0.10] [--attack 0.10] [--decay 0.35]
 """
 
 import collections
 import sys
+import threading
 import time
 
 import numpy as np
@@ -42,38 +36,71 @@ from hue.stream import _build_channel_maps, _send_frame
 
 requests.packages.urllib3.disable_warnings()
 
-BLOCKSIZE = 1024  # samples per audio block (~23ms at 44.1kHz)
-
-# Flavor band/response (internal defaults): higher frequencies, faster + busier.
+BLOCKSIZE = 1024
 FLAVOR_BAND = (1500, 7000)
 FLAVOR_SENSITIVITY = 1.5
 FLAVOR_REFRACTORY = 0.13
 FLAVOR_DECAY = 0.12
 FLAVOR_ATTACK = 0.05
 
-# Bass pulse strength (energy / recent-average - 1) at which the anchor reaches
-# full swell. Lower = more sensitive to the groove.
-PULSE_SCALE = 1.3
+DEFAULTS = {
+    "color": "red",
+    "flavor_color": "amber",
+    "flavor": "",  # comma list of names/IDs; rest are anchor
+    "sensitivity": 1.7,
+    "refractory": 0.34,
+    "decay": 0.35,
+    "attack": 0.10,
+    "min_bright": 0.04,
+    "max_bright": 0.22,
+    "flavor_max": 0.10,
+    "pulse_scale": 1.3,
+    "gain": 0.0,
+    "floor": 0.04,
+}
+
+# Slider/param spec for the web UI.
+PARAMS = [
+    {"name": "max_bright", "label": "Anchor brightness", "min": 0.02, "max": 0.6, "step": 0.01},
+    {"name": "flavor_max", "label": "Flavor brightness", "min": 0.0, "max": 0.4, "step": 0.01},
+    {"name": "min_bright", "label": "Baseline glow", "min": 0.0, "max": 0.2, "step": 0.005},
+    {"name": "attack", "label": "Attack (s)", "min": 0.02, "max": 0.5, "step": 0.01},
+    {"name": "decay", "label": "Release (s)", "min": 0.05, "max": 1.0, "step": 0.01},
+    {"name": "pulse_scale", "label": "Bass pulse scale", "min": 0.3, "max": 3.0, "step": 0.05},
+    {"name": "sensitivity", "label": "Flavor sensitivity", "min": 1.05, "max": 3.0, "step": 0.05},
+    {"name": "refractory", "label": "Anchor refractory (s)", "min": 0.05, "max": 0.8, "step": 0.01},
+    {"name": "gain", "label": "Loudness glow", "min": 0.0, "max": 5.0, "step": 0.1},
+    {"name": "color", "label": "Anchor color", "type": "color"},
+    {"name": "flavor_color", "label": "Flavor color", "type": "color"},
+    {"name": "flavor", "label": "Flavor lights (names)", "type": "text"},
+]
 
 
 def list_devices():
     print("Audio input devices:")
-    for i, d in enumerate(sd.query_devices()):
-        if d["max_input_channels"] > 0:
-            print(f"  [{i}] {d['name']}  (in:{d['max_input_channels']})")
+    for d in input_devices():
+        print(f"  [{d['index']}] {d['name']}  (in:{d['channels']})")
     print("\nPick the BlackHole device for loopback capture.")
 
 
+def input_devices():
+    return [
+        {"index": i, "name": d["name"], "channels": d["max_input_channels"]}
+        for i, d in enumerate(sd.query_devices())
+        if d["max_input_channels"] > 0
+    ]
+
+
 def _resolve_device(spec):
-    if spec is None:
+    if spec is None or spec == "":
         return None
     try:
         return int(spec)
     except (TypeError, ValueError):
         pass
-    for i, d in enumerate(sd.query_devices()):
-        if d["max_input_channels"] > 0 and spec.lower() in d["name"].lower():
-            return i
+    for d in input_devices():
+        if spec.lower() in d["name"].lower():
+            return d["index"]
     raise SystemExit(f"No input device matching '{spec}'. Try `hue beatsync --list`.")
 
 
@@ -91,7 +118,6 @@ _COLORS = {
 
 
 def _parse_color(spec):
-    """Resolve a color name or 'r,g,b' string to an (r, g, b) tuple."""
     if isinstance(spec, (tuple, list)):
         return tuple(spec)
     s = str(spec).strip().lower()
@@ -105,7 +131,6 @@ def _parse_color(spec):
 
 
 def _resolve_light_ids(spec, name_to_id):
-    """Parse a comma list of light names/IDs into a set of v1 light IDs."""
     ids = set()
     for tok in str(spec).split(","):
         tok = tok.strip()
@@ -121,11 +146,7 @@ def _resolve_light_ids(spec, name_to_id):
 
 
 class BandOnset:
-    """Onset detector for one frequency band, with an adaptive threshold.
-
-    Tracks recent band energy; an onset is a local spike above `sensitivity` x
-    the recent average, gated by a loudness floor and a refractory period.
-    """
+    """Per-band detector: continuous pulse strength + discrete onset times."""
 
     def __init__(self, samplerate, lo, hi, sensitivity, refractory, floor):
         freqs = np.fft.rfftfreq(BLOCKSIZE, 1.0 / samplerate)
@@ -135,10 +156,10 @@ class BandOnset:
         self.sensitivity = sensitivity
         self.refractory = refractory
         self.floor = floor
-        self.level = 0.0  # smoothed overall RMS
-        self.last_beat = -1e9  # discrete onset time (used by flavor)
-        self._avg = 1e-9  # EMA of band energy (~0.6s)
-        self.strength = 0.0  # continuous pulse strength (used by anchor)
+        self.level = 0.0
+        self.last_beat = -1e9
+        self._avg = 1e-9
+        self.strength = 0.0
 
     def process(self, mono, now):
         if len(mono) != BLOCKSIZE:
@@ -147,17 +168,11 @@ class BandOnset:
         self.level = 0.9 * self.level + 0.1 * rms
         mag = np.abs(np.fft.rfft(mono * self._window))
         energy = float(np.sum(mag[self._band] ** 2))
-
-        # Continuous pulse strength: how far this block's band energy rises above
-        # its recent average. Tracks kicks even when the bass is sustained, where
-        # a fixed onset threshold would miss them. Gated by the loudness floor.
         if self.level > self.floor:
             self.strength = max(0.0, energy / (self._avg + 1e-12) - 1.0)
         else:
             self.strength = 0.0
         self._avg = 0.95 * self._avg + 0.05 * energy
-
-        # Discrete onset (for the flavor layer).
         if self._hist and self.level > self.floor:
             avg = sum(self._hist) / len(self._hist)
             if energy > self.sensitivity * avg and now - self.last_beat > self.refractory:
@@ -181,7 +196,7 @@ def _connect(ip, api_key, client_key):
     ent = hep.Entertainment(bridge)
     configs = ent.get_entertainment_configs()
     if not configs:
-        raise SystemExit("No entertainment area on the bridge.")
+        raise RuntimeError("No entertainment area on the bridge.")
     config_id = list(configs.keys())[0]
     streaming = hep.Streaming(bridge, configs[config_id], ent.get_ent_conf_repo())
     streaming.set_color_space("rgb")
@@ -189,117 +204,135 @@ def _connect(ip, api_key, client_key):
     return streaming
 
 
-def run(
-    device=None,
-    color="red",
-    flavor_color="amber",
-    flavor=None,
-    sensitivity=1.7,
-    refractory=0.34,
-    decay=0.35,
-    attack=0.10,
-    min_bright=0.04,
-    max_bright=0.22,
-    flavor_max=0.10,
-    gain=0.0,
-    floor=0.04,
-):
-    """Capture audio and drive anchor + flavor lights until interrupted."""
-    env = dotenv_values(".env")
-    ip, api_key, client_key = (
-        env["HUE_BRIDGE_IP"],
-        env["HUE_API_KEY"],
-        env["HUE_CLIENT_KEY"],
-    )
+class BeatSyncEngine:
+    """Runs capture + render in a background thread; accepts live param updates."""
 
-    from hue.smooth import stop_smooth
-    from hue.stream import stop_stream
+    def __init__(self):
+        self.params = dict(DEFAULTS)
+        self._lock = threading.Lock()
+        self._thread = None
+        self._stop = threading.Event()
+        self.error = None
 
-    stop_stream()
-    stop_smooth()
+    def is_running(self):
+        return self._thread is not None and self._thread.is_alive()
 
-    dev = _resolve_device(device)
-    info = sd.query_devices(dev if dev is not None else sd.default.device[0])
-    samplerate = int(info["default_samplerate"])
-    channels = min(2, info["max_input_channels"]) or 1
-    print(f"Capturing from [{dev}] {info['name']} @ {samplerate}Hz, {channels}ch")
+    def set_params(self, **kw):
+        with self._lock:
+            self.params.update({k: v for k, v in kw.items() if v is not None})
 
-    bass_rgb = _parse_color(color)
-    flavor_rgb = _parse_color(flavor_color)
-    bass = BandOnset(samplerate, 30, 120, sensitivity, refractory, floor)
-    flav = BandOnset(
-        samplerate, *FLAVOR_BAND, FLAVOR_SENSITIVITY, FLAVOR_REFRACTORY, floor
-    )
+    def start(self, device=None, **params):
+        if self.is_running():
+            self.set_params(**params)
+            return
+        self.set_params(**params)
+        self.error = None
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, args=(device,), daemon=True)
+        self._thread.start()
 
-    def audio_cb(indata, frames, time_info, status):
-        mono = indata.mean(axis=1) if indata.ndim > 1 else indata
-        m = np.asarray(mono, dtype=np.float64)
-        now = time.monotonic()
-        bass.process(m, now)
-        flav.process(m, now)
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=8)
+            self._thread = None
 
-    streaming = _connect(ip, api_key, client_key)
-    light_to_channel, _ = _build_channel_maps(ip, api_key)
-    all_channels = sorted(light_to_channel.values())
+    def _snapshot(self):
+        with self._lock:
+            return dict(self.params)
 
-    # Assign each light to anchor (bass) or flavor. Default: interleave so the
-    # flavor accents are spread around the room.
-    if flavor:
+    def _run(self, device):
+        try:
+            self._loop(device)
+        except Exception as exc:  # surface to the UI rather than dying silently
+            self.error = str(exc)
+
+    def _loop(self, device):
+        env = dotenv_values(".env")
+        ip, api_key, client_key = (
+            env["HUE_BRIDGE_IP"],
+            env["HUE_API_KEY"],
+            env["HUE_CLIENT_KEY"],
+        )
+        from hue.smooth import stop_smooth
+        from hue.stream import stop_stream
+
+        stop_stream()
+        stop_smooth()
+
+        dev = _resolve_device(device)
+        info = sd.query_devices(dev if dev is not None else sd.default.device[0])
+        samplerate = int(info["default_samplerate"])
+        channels = min(2, info["max_input_channels"]) or 1
+
+        p = self._snapshot()
+        bass = BandOnset(samplerate, 30, 120, p["sensitivity"], p["refractory"], p["floor"])
+        flav = BandOnset(
+            samplerate, *FLAVOR_BAND, FLAVOR_SENSITIVITY, FLAVOR_REFRACTORY, p["floor"]
+        )
+
+        def audio_cb(indata, frames, time_info, status):
+            mono = indata.mean(axis=1) if indata.ndim > 1 else indata
+            m = np.asarray(mono, dtype=np.float64)
+            now = time.monotonic()
+            bass.process(m, now)
+            flav.process(m, now)
+
+        streaming = _connect(ip, api_key, client_key)
+        light_to_channel, _ = _build_channel_maps(ip, api_key)
+        all_channels = sorted(light_to_channel.values())
         lights = requests.get(
             f"https://{ip}/api/{api_key}/lights", verify=False, timeout=8
         ).json()
         name_to_id = {v["name"].strip().lower(): int(k) for k, v in lights.items()}
-        flavor_ids = _resolve_light_ids(flavor, name_to_id)
-        flavor_channels = {
-            light_to_channel[i] for i in flavor_ids if i in light_to_channel
-        }
-    else:
-        flavor_channels = set(all_channels[1::2])
-    print(
-        f"Anchor (bass) channels: {sorted(set(all_channels) - flavor_channels)} | "
-        f"Flavor channels: {sorted(flavor_channels)}. Ctrl-C to stop."
-    )
 
-    fps = 50
-    interval = 1.0 / fps
-    # Anchor swell uses a fast attack / slow release; flavor is just fast.
-    bass_attack_k = 1.0 - np.exp(-interval / max(1e-3, attack))
-    bass_release_k = 1.0 - np.exp(-interval / max(1e-3, decay))
-    flav_k = 1.0 - np.exp(-interval / max(1e-3, FLAVOR_ATTACK))
-    bass_env = 0.0
-    flav_env = 0.0
+        def compute_flavor_channels(spec):
+            if spec:
+                ids = _resolve_light_ids(spec, name_to_id)
+                return {light_to_channel[i] for i in ids if i in light_to_channel}
+            return set(all_channels[1::2])
 
-    stream = sd.InputStream(
-        device=dev,
-        channels=channels,
-        samplerate=samplerate,
-        blocksize=BLOCKSIZE,
-        callback=audio_cb,
-    )
-    try:
+        flavor_spec = p["flavor"]
+        flavor_channels = compute_flavor_channels(flavor_spec)
+
+        interval = 1.0 / 50
+        bass_env = flav_env = 0.0
+        stream = sd.InputStream(
+            device=dev,
+            channels=channels,
+            samplerate=samplerate,
+            blocksize=BLOCKSIZE,
+            callback=audio_cb,
+        )
         with stream:
             next_frame = time.monotonic()
-            while True:
+            while not self._stop.is_set():
+                p = self._snapshot()
+                if p["flavor"] != flavor_spec:
+                    flavor_spec = p["flavor"]
+                    flavor_channels = compute_flavor_channels(flavor_spec)
+                bass.sensitivity = p["sensitivity"]
+                bass.refractory = p["refractory"]
+                bass.floor = flav.floor = p["floor"]
+                bass_rgb = _parse_color(p["color"])
+                flav_rgb = _parse_color(p["flavor_color"])
+                attack_k = 1.0 - np.exp(-interval / max(1e-3, p["attack"]))
+                release_k = 1.0 - np.exp(-interval / max(1e-3, p["decay"]))
+                flav_k = 1.0 - np.exp(-interval / max(1e-3, FLAVOR_ATTACK))
+
                 now = time.monotonic()
-                # Anchor: continuous bass-pulse strength, fast attack / slow
-                # release for a musical swell that tracks the kick.
-                target = min(1.0, bass.strength / PULSE_SCALE)
-                k = bass_attack_k if target > bass_env else bass_release_k
-                bass_env += (target - bass_env) * k
-                # Flavor: discrete high-band accents, dimmer.
+                target = min(1.0, bass.strength / max(0.05, p["pulse_scale"]))
+                bass_env += (target - bass_env) * (
+                    attack_k if target > bass_env else release_k
+                )
                 ifl = np.exp(-(now - flav.last_beat) / FLAVOR_DECAY)
                 flav_env += (ifl - flav_env) * flav_k
 
-                bass_b = min(
-                    max_bright,
-                    min_bright + (max_bright - min_bright) * bass_env + gain * bass.level,
-                )
-                flav_b = min(
-                    flavor_max, min_bright + (flavor_max - min_bright) * flav_env
-                )
+                mn, mx, fmx = p["min_bright"], p["max_bright"], p["flavor_max"]
+                bass_b = min(mx, mn + (mx - mn) * bass_env + p["gain"] * bass.level)
+                flav_b = min(fmx, mn + (fmx - mn) * flav_env)
                 bass_px = tuple(c * bass_b for c in bass_rgb)
-                flav_px = tuple(c * flav_b for c in flavor_rgb)
-
+                flav_px = tuple(c * flav_b for c in flav_rgb)
                 frame = [
                     (cid, *(flav_px if cid in flavor_channels else bass_px))
                     for cid in all_channels
@@ -312,13 +345,32 @@ def run(
                     time.sleep(sleep)
                 else:
                     next_frame = time.monotonic()
-    except KeyboardInterrupt:
-        print("\nStopping.")
-    finally:
+
         try:
             streaming.stop_stream()
         except Exception:
             pass
+
+
+def run(device=None, **params):
+    """CLI entry: run the engine in the foreground until Ctrl-C."""
+    engine = BeatSyncEngine()
+    engine.start(device=device, **params)
+    if engine.error:
+        raise SystemExit(engine.error)
+    print(
+        f"beatsync running on device {device!r}. Ctrl-C to stop.\n"
+        f"(Tune live in the browser with `hue ui`.)"
+    )
+    try:
+        while engine.is_running():
+            time.sleep(0.3)
+            if engine.error:
+                raise SystemExit(engine.error)
+    except KeyboardInterrupt:
+        print("\nStopping.")
+    finally:
+        engine.stop()
 
 
 if __name__ == "__main__":

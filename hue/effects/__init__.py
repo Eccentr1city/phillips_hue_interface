@@ -1,6 +1,7 @@
 """Effect loader — discovers built-in and user-defined effects."""
 
 import importlib.util
+import inspect
 from pathlib import Path
 
 # Built-in effects directory (alongside this file)
@@ -20,6 +21,19 @@ def _load_effect_from_file(path: Path) -> dict | None:
     render_fn = getattr(mod, "render", None)
     if render_fn is None:
         return None
+    # Tunable param spec for the UI (module-level PARAMS), with defaults filled
+    # in from the render() signature so they're not duplicated.
+    sig = inspect.signature(render_fn)
+    params = []
+    for spec in getattr(mod, "PARAMS", []):
+        spec = dict(spec)
+        spec.setdefault("type", "float")
+        spec.setdefault("label", spec["name"])
+        if "default" not in spec:
+            sig_param = sig.parameters.get(spec["name"])
+            if sig_param is not None and sig_param.default is not inspect.Parameter.empty:
+                spec["default"] = sig_param.default
+        params.append(spec)
     return {
         "name": path.stem,
         "path": str(path),
@@ -29,6 +43,7 @@ def _load_effect_from_file(path: Path) -> dict | None:
         # Preferred rendering backend: "smooth" (REST fades) or "streaming".
         # The CLI uses this when no --smooth/--stream flag is given.
         "mode": getattr(mod, "MODE", None),
+        "params": params,
     }
 
 

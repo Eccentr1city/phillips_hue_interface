@@ -12,6 +12,12 @@ import random
 
 PHI = (1 + math.sqrt(5)) / 2
 
+PARAMS = [
+    {"name": "speed", "label": "Speed", "min": 0.2, "max": 3.0, "step": 0.05},
+    {"name": "floor", "label": "Min brightness", "min": 0.0, "max": 0.9, "step": 0.02},
+    {"name": "ceil", "label": "Max brightness", "min": 0.1, "max": 1.0, "step": 0.02},
+]
+
 # Per-light persistent state keyed by phase seed
 _states: dict[float, dict] = {}
 

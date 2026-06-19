@@ -31,6 +31,14 @@ import math
 # Prefer the smooth (REST firmware-fade) backend — this is a slow ambient effect.
 MODE = "smooth"
 
+# Tunable params for the web UI (defaults pulled from render()'s signature).
+PARAMS = [
+    {"name": "speed", "label": "Speed", "min": 0.0, "max": 3.0, "step": 0.02},
+    {"name": "width", "label": "Wavelength (half-width)", "min": 0.2, "max": 3.0, "step": 0.05},
+    {"name": "angle", "label": "Angle (deg, off Y toward X)", "min": 0, "max": 90, "step": 1},
+    {"name": "rest", "label": "Dark rest (s)", "min": 0.0, "max": 15.0, "step": 0.5},
+]
+
 
 def render(
     t: float,

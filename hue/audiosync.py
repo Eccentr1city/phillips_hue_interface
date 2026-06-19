@@ -64,6 +64,7 @@ DEFAULTS = {
     "max_bright": 0.22,
     "flavor_max": 0.10,
     "flavor_sensitivity": 1.5,
+    "downbeat_emphasis": 0.5,  # how much weaker non-downbeats are vs the "1"
     "gain": 0.0,
     # Fallback energy-follow tuning (used only before the beat grid locks);
     # not exposed in the UI. sensitivity/refractory are set above.
@@ -80,6 +81,7 @@ PARAMS = [
     {"name": "min_bright", "label": "Baseline glow", "min": 0.0, "max": 0.2, "step": 0.005},
     {"name": "attack", "label": "Beat attack (s)", "min": 0.02, "max": 0.5, "step": 0.01},
     {"name": "decay", "label": "Beat sustain (s)", "min": 0.05, "max": 1.0, "step": 0.01},
+    {"name": "downbeat_emphasis", "label": "Downbeat accent", "min": 0.0, "max": 0.9, "step": 0.05},
     {"name": "flavor_sensitivity", "label": "Flavor sensitivity", "min": 1.05, "max": 3.0, "step": 0.05},
     {"name": "gain", "label": "Loudness glow", "min": 0.0, "max": 5.0, "step": 0.1},
     {"name": "color", "label": "Anchor color", "type": "color"},
@@ -285,6 +287,9 @@ class BeatTracker:
             return None
         return (now - self.beat_ref) % self.period
 
+    def current_pos(self, now):
+        return None  # librosa has no downbeat/bar info
+
 
 class SidecarBeatTracker:
     """Beat source backed by the madmom sidecar (isolated Python 3.9 process).
@@ -300,6 +305,8 @@ class SidecarBeatTracker:
         self.port = port
         self.period = None
         self.beat_ref = 0.0
+        self.ref_pos = 1  # bar position (1-indexed) of the beat at beat_ref
+        self.bpb = 4  # beats per bar
         self.bpm = 0.0
         self.ready = False
         self._stop = threading.Event()
@@ -337,25 +344,32 @@ class SidecarBeatTracker:
                 break
             try:
                 msg = json.loads(data.decode())
-                bpm = float(msg["bpm"])
-                since = float(msg["since"])
+                period = float(msg["period"])
+                age = float(msg["age"])
+                pos = int(msg["pos"])
+                bpb = int(msg["bpb"])
             except (ValueError, KeyError):
                 continue
-            if bpm <= 0:
+            if period <= 0:
                 continue
             now = time.monotonic()
-            period = 60.0 / bpm
-            beat = now - since
-            if self.period is None:
-                self.period, self.beat_ref = period, beat
-            else:
-                self.period = 0.7 * self.period + 0.3 * period
-                err = (beat - self.beat_ref) % self.period
-                if err > self.period / 2:
-                    err -= self.period
-                self.beat_ref += 0.5 * err
+            self.period = (
+                period if self.period is None else 0.6 * self.period + 0.4 * period
+            )
+            # Re-anchor the grid to the last detected beat each packet; the `age`
+            # already accounts for analysis latency, so this lands on the beat.
+            self.beat_ref = now - age
+            self.ref_pos = pos
+            self.bpb = max(1, bpb)
             self.bpm = 60.0 / self.period
             self.ready = True
+
+    def current_pos(self, now):
+        """Bar position (1-indexed, 1 = downbeat) of the most recent beat."""
+        if not self.ready or not self.period or self.bpb <= 1:
+            return None
+        k = int((now - self.beat_ref) // self.period)
+        return ((self.ref_pos - 1 + k) % self.bpb) + 1
 
     def stop(self):
         self._stop.set()
@@ -548,12 +562,15 @@ class BeatSyncEngine:
                 flav_k = 1.0 - np.exp(-interval / max(1e-3, FLAVOR_ATTACK))
 
                 now = time.monotonic()
-                # Anchor target: a pulse on the tracked beat grid (predicts
-                # through gaps); fall back to raw energy-follow when there's no
-                # confident tempo yet (intro/ambient) or during near-silence.
-                tsb = tracker.seconds_since_beat(now) if bass.level > p["floor"] else None
-                if tsb is not None:
-                    target = float(np.exp(-tsb / max(0.05, p["decay"])))
+                # Anchor: pulse on the tracked beat grid (predicts through gaps),
+                # with the downbeat ("1") accented. Only fall back to raw
+                # energy-follow before the grid has locked — not during quiet
+                # bars, which would feel random.
+                if tracker.ready:
+                    tsb = tracker.seconds_since_beat(now)
+                    pos = tracker.current_pos(now)
+                    amp = 1.0 if pos in (None, 1) else (1.0 - p["downbeat_emphasis"])
+                    target = amp * float(np.exp(-tsb / max(0.05, p["decay"])))
                 else:
                     target = min(1.0, bass.strength / max(0.05, p["pulse_scale"]))
                 bass_env += (target - bass_env) * (

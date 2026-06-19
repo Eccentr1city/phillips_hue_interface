@@ -47,7 +47,10 @@ def main():
     args = ap.parse_args()
 
     from madmom.audio.signal import Signal
-    from madmom.features.beats import DBNBeatTrackingProcessor, RNNBeatProcessor
+    from madmom.features.downbeats import (
+        DBNDownBeatTrackingProcessor,
+        RNNDownBeatProcessor,
+    )
 
     dev = resolve_device(args.device)
     info = sd.query_devices(dev if dev is not None else sd.default.device[0])
@@ -76,8 +79,8 @@ def main():
             state["filled"] = min(maxlen, state["filled"] + n)
             state["last_t"] = now
 
-    rnn = RNNBeatProcessor()
-    dbn = DBNBeatTrackingProcessor(fps=100)
+    rnn = RNNDownBeatProcessor()
+    dbn = DBNDownBeatTrackingProcessor(beats_per_bar=[3, 4], fps=100)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     stream = sd.InputStream(
@@ -95,6 +98,7 @@ def main():
                 else:
                     w = state["widx"]
                     y = np.concatenate((ring[w:], ring[:w]))
+                tlast = state["last_t"]
             if not np.any(np.abs(y) > 1e-4):
                 continue
             dur = len(y) / sr
@@ -104,16 +108,27 @@ def main():
                 g = np.gcd(44100, sr)
                 y = resample_poly(y, 44100 // g, sr // g).astype(np.float32)
             try:
+                # beats: Nx2 array of [time_sec, position_in_bar] (1 = downbeat)
                 beats = dbn(rnn(Signal(y, sample_rate=44100, num_channels=1)))
             except Exception as exc:
                 print(f"[sidecar] error: {exc}", flush=True)
                 continue
             if len(beats) < 2:
                 continue
-            period = float(np.median(np.diff(beats)))
+            times = beats[:, 0]
+            period = float(np.median(np.diff(times)))
             if period <= 0:
                 continue
-            msg = {"bpm": round(60.0 / period, 2), "since": round(dur - float(beats[-1]), 4)}
+            # Age of the last detected beat as of NOW — includes the analysis
+            # time, so the main lands the grid on the beat rather than lagging by
+            # however long madmom took to run.
+            age = (time.monotonic() - tlast) + (dur - float(times[-1]))
+            msg = {
+                "period": round(period, 5),
+                "age": round(age, 4),
+                "pos": int(beats[-1, 1]),
+                "bpb": int(beats[:, 1].max()),
+            }
             sock.sendto(json.dumps(msg).encode(), (args.host, args.port))
 
 

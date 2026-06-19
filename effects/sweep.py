@@ -46,7 +46,7 @@ def render(
     b = cool[2] + (hot[2] - cool[2]) * i
 
     return (
-        int(min(255, max(0, r))),
-        int(min(255, max(0, g))),
-        int(min(255, max(0, b))),
+        min(255.0, max(0.0, r)),
+        min(255.0, max(0.0, g)),
+        min(255.0, max(0.0, b)),
     )

@@ -195,7 +195,18 @@ def _effect_kwargs(
     return kwargs
 
 
-def _send_frame(streaming, frame: list[tuple[int, int, int, int]]):
+def _u16(v: float) -> int:
+    """Scale a 0..255 (possibly fractional) color value to a 0..65535 uint16.
+
+    Effects compute in floating point, so feeding the bridge real 16-bit values
+    (65536 levels) instead of 8-bit (256 levels) is what makes slow fades smooth
+    — at 8 bits the bulb visibly holds each discrete step through the dim parts.
+    """
+    iv = int(v * 257.0 + 0.5)  # 257 == 65535 / 255
+    return 0 if iv < 0 else 65535 if iv > 65535 else iv
+
+
+def _send_frame(streaming, frame: list[tuple[int, float, float, float]]):
     """Send one DTLS packet containing ALL channels for this frame.
 
     The pykit ``set_input`` queues each channel and its worker thread sends a
@@ -211,13 +222,7 @@ def _send_frame(streaming, frame: list[tuple[int, int, int, int]]):
     svc = streaming._streaming_service
     channel_data = b""
     for channel_id, r, g, b in frame:
-        channel_data += struct.pack(
-            ">BHHH",
-            channel_id,
-            (r * 65535) // 255,
-            (g * 65535) // 255,
-            (b * 65535) // 255,
-        )
+        channel_data += struct.pack(">BHHH", channel_id, _u16(r), _u16(g), _u16(b))
     message = svc._build_message(channel_data)
     svc._dtls_service.get_socket().send(message)
     svc._last_message = message

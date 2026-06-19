@@ -71,7 +71,7 @@ def render(t: float, speed: float = 1.0, phase: float = 0.0) -> tuple[int, int, 
     b = 0.03 * brightness
 
     return (
-        int(min(1, max(0, r)) * 255),
-        int(min(1, max(0, g)) * 255),
-        int(min(1, max(0, b)) * 255),
+        min(1.0, max(0.0, r)) * 255.0,
+        min(1.0, max(0.0, g)) * 255.0,
+        min(1.0, max(0.0, b)) * 255.0,
     )

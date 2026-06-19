@@ -276,10 +276,11 @@ def _cmd_beatsync(args: list[str]):
         flavor=flags.get("flavor"),
         sensitivity=float(flags.get("sensitivity", 1.7)),
         refractory=float(flags.get("refractory", 0.34)),
-        decay=float(flags.get("decay", 0.30)),
-        attack=float(flags.get("attack", 0.16)),
+        decay=float(flags.get("decay", 0.35)),
+        attack=float(flags.get("attack", 0.10)),
         min_bright=float(flags.get("min-bright", 0.04)),
         max_bright=float(flags.get("max-bright", 0.22)),
+        flavor_max=float(flags.get("flavor-max", 0.10)),
         gain=float(flags.get("gain", 0.0)),
         floor=float(flags.get("floor", 0.04)),
     )

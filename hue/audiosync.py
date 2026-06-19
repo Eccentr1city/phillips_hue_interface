@@ -20,9 +20,13 @@ BlackHole input device.
 Usage:
     hue beatsync --list
     hue beatsync [--device <name>] [--color red] [--flavor-color amber]
-                 [--flavor "Desk,Bedside"] [--max-bright 0.22] [--min-bright 0.04]
-                 [--sensitivity 1.7] [--refractory 0.34] [--decay 0.30]
-                 [--attack 0.16] [--gain 0]
+                 [--flavor "Wall closet,Wall right"] [--max-bright 0.22]
+                 [--flavor-max 0.10] [--min-bright 0.04] [--attack 0.10]
+                 [--decay 0.35] [--gain 0]
+
+    Anchor (bass) brightness rises with --max-bright using a fast --attack /
+    slow --decay swell; flavor accents are capped by --flavor-max (keep it
+    below --max-bright so they sit under the bass).
 """
 
 import collections
@@ -43,9 +47,13 @@ BLOCKSIZE = 1024  # samples per audio block (~23ms at 44.1kHz)
 # Flavor band/response (internal defaults): higher frequencies, faster + busier.
 FLAVOR_BAND = (1500, 7000)
 FLAVOR_SENSITIVITY = 1.5
-FLAVOR_REFRACTORY = 0.10
+FLAVOR_REFRACTORY = 0.13
 FLAVOR_DECAY = 0.12
 FLAVOR_ATTACK = 0.05
+
+# Bass pulse strength (energy / recent-average - 1) at which the anchor reaches
+# full swell. Lower = more sensitive to the groove.
+PULSE_SCALE = 1.3
 
 
 def list_devices():
@@ -128,7 +136,9 @@ class BandOnset:
         self.refractory = refractory
         self.floor = floor
         self.level = 0.0  # smoothed overall RMS
-        self.last_beat = -1e9
+        self.last_beat = -1e9  # discrete onset time (used by flavor)
+        self._avg = 1e-9  # EMA of band energy (~0.6s)
+        self.strength = 0.0  # continuous pulse strength (used by anchor)
 
     def process(self, mono, now):
         if len(mono) != BLOCKSIZE:
@@ -137,6 +147,17 @@ class BandOnset:
         self.level = 0.9 * self.level + 0.1 * rms
         mag = np.abs(np.fft.rfft(mono * self._window))
         energy = float(np.sum(mag[self._band] ** 2))
+
+        # Continuous pulse strength: how far this block's band energy rises above
+        # its recent average. Tracks kicks even when the bass is sustained, where
+        # a fixed onset threshold would miss them. Gated by the loudness floor.
+        if self.level > self.floor:
+            self.strength = max(0.0, energy / (self._avg + 1e-12) - 1.0)
+        else:
+            self.strength = 0.0
+        self._avg = 0.95 * self._avg + 0.05 * energy
+
+        # Discrete onset (for the flavor layer).
         if self._hist and self.level > self.floor:
             avg = sum(self._hist) / len(self._hist)
             if energy > self.sensitivity * avg and now - self.last_beat > self.refractory:
@@ -175,10 +196,11 @@ def run(
     flavor=None,
     sensitivity=1.7,
     refractory=0.34,
-    decay=0.30,
-    attack=0.16,
+    decay=0.35,
+    attack=0.10,
     min_bright=0.04,
     max_bright=0.22,
+    flavor_max=0.10,
     gain=0.0,
     floor=0.04,
 ):
@@ -240,7 +262,9 @@ def run(
 
     fps = 50
     interval = 1.0 / fps
-    bass_k = 1.0 - np.exp(-interval / max(1e-3, attack))
+    # Anchor swell uses a fast attack / slow release; flavor is just fast.
+    bass_attack_k = 1.0 - np.exp(-interval / max(1e-3, attack))
+    bass_release_k = 1.0 - np.exp(-interval / max(1e-3, decay))
     flav_k = 1.0 - np.exp(-interval / max(1e-3, FLAVOR_ATTACK))
     bass_env = 0.0
     flav_env = 0.0
@@ -257,14 +281,22 @@ def run(
             next_frame = time.monotonic()
             while True:
                 now = time.monotonic()
-                ib = np.exp(-(now - bass.last_beat) / decay)
-                bass_env += (ib - bass_env) * bass_k
+                # Anchor: continuous bass-pulse strength, fast attack / slow
+                # release for a musical swell that tracks the kick.
+                target = min(1.0, bass.strength / PULSE_SCALE)
+                k = bass_attack_k if target > bass_env else bass_release_k
+                bass_env += (target - bass_env) * k
+                # Flavor: discrete high-band accents, dimmer.
                 ifl = np.exp(-(now - flav.last_beat) / FLAVOR_DECAY)
                 flav_env += (ifl - flav_env) * flav_k
 
-                span = max_bright - min_bright
-                bass_b = min(max_bright, min_bright + span * bass_env + gain * bass.level)
-                flav_b = min(max_bright, min_bright + span * flav_env)
+                bass_b = min(
+                    max_bright,
+                    min_bright + (max_bright - min_bright) * bass_env + gain * bass.level,
+                )
+                flav_b = min(
+                    flavor_max, min_bright + (flavor_max - min_bright) * flav_env
+                )
                 bass_px = tuple(c * bass_b for c in bass_rgb)
                 flav_px = tuple(c * flav_b for c in flavor_rgb)
 

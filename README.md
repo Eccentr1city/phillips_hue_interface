@@ -40,16 +40,16 @@ b.light(1).off()
 ### CLI
 
 ```bash
-uv run hue status                         # show all lights
-uv run hue set all --color red             # set color
-uv run hue set 1 --brightness 0.5          # set brightness
-uv run hue set all --effect candle         # start streaming effect
-uv run hue on                              # all lights on
-uv run hue off 1                           # turn off light 1
-uv run hue list                            # list effects and scenes
-uv run hue scene save cozy                 # snapshot current state
-uv run hue scene set cozy                  # restore a saved scene
-uv run hue stop                            # stop streaming effects
+uv run python -m hue status                         # show all lights
+uv run python -m hue set all --color red             # set color
+uv run python -m hue set 1 --brightness 0.5          # set brightness
+uv run python -m hue set all --effect candle         # start streaming effect
+uv run python -m hue on                              # all lights on
+uv run python -m hue off 1                           # turn off light 1
+uv run python -m hue list                            # list effects and scenes
+uv run python -m hue scene save cozy                 # snapshot current state
+uv run python -m hue scene set cozy                  # restore a saved scene
+uv run python -m hue stop                            # stop streaming effects
 ```
 
 ### Claude assistant integration
@@ -143,7 +143,7 @@ Scenes are JSON files in `scenes/` mapping light IDs to configurations. They can
 
 Save the current light state as a scene:
 ```bash
-uv run hue scene save mysetup
+uv run python -m hue scene save mysetup
 ```
 
 ## Project structure

@@ -9,10 +9,11 @@ in-process engine. Start/Stop and a device picker for beatsync are included.
 import os
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, send_file
 
 from hue import score as score_mod
 from hue.audiosync import BEATENV_PY, PROJECT_DIR
@@ -25,7 +26,10 @@ app = Flask(__name__)
 _engine = BeatSyncEngine()
 _bridge = None
 _scores = {}  # score_id -> light score
+_audio = {}  # score_id -> fetched audio file path (for browser playback)
 _layout = None  # cached light layout (positions + names)
+_VIZ_DIR = os.path.join(tempfile.gettempdir(), "hue_viz")
+os.makedirs(_VIZ_DIR, exist_ok=True)
 
 
 def _get_bridge():
@@ -140,35 +144,24 @@ def _ensure_layout():
     return _layout
 
 
-@app.post("/api/analyze")
-def analyze():
-    """Accept an uploaded audio file, analyze it offline, return a light score."""
+def _run_analyzer(audio_path):
+    """Run the offline analyzer (.beatenv madmom) on a file; return a score dict."""
     if not BEATENV_PY.exists():
-        return jsonify({"error": "Run `hue beatsetup` first (.beatenv missing)."}), 400
-    f = request.files.get("audio")
-    if f is None:
-        return jsonify({"error": "no audio uploaded"}), 400
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(f.filename or "x.wav").suffix)
-    f.save(tmp.name)
-    tmp.close()
-    out = tmp.name + ".score.json"
+        raise RuntimeError("Run `hue beatsetup` first (.beatenv missing).")
+    out = audio_path + ".score.json"
     proc = subprocess.run(
-        [str(BEATENV_PY), str(PROJECT_DIR / "analyze_offline.py"), tmp.name, out],
+        [str(BEATENV_PY), str(PROJECT_DIR / "analyze_offline.py"), audio_path, out],
         capture_output=True,
         text=True,
     )
-    for path in (tmp.name,):  # discard the audio; keep only the score
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
     if proc.returncode != 0 or not os.path.exists(out):
-        tail = (proc.stderr or "")[-300:]
-        return jsonify({"error": f"analysis failed: {tail}"}), 500
+        raise RuntimeError((proc.stderr or "analysis failed")[-300:])
     score = score_mod.load_score(out)
     os.unlink(out)
-    sid = uuid.uuid4().hex[:8]
-    _scores[sid] = score
+    return score
+
+
+def _score_params():
     params = []
     for spec in score_mod.PARAMS:
         spec = dict(spec)
@@ -176,17 +169,114 @@ def analyze():
         spec.setdefault("label", spec["name"])
         spec["default"] = score_mod.DEFAULTS.get(spec["name"])
         params.append(spec)
+    return params
+
+
+def _score_response(sid, score, **extra):
     return jsonify(
         {
             "score_id": sid,
             "layout": _ensure_layout(),
-            "params": params,
+            "params": _score_params(),
             "colors": list(COLORS.keys()),
             "duration": score["duration"],
             "tempo": score["tempo"],
             "beats_per_bar": score["beats_per_bar"],
+            **extra,
         }
     )
+
+
+@app.post("/api/analyze")
+def analyze():
+    """Analyze an uploaded audio file (the browser plays its own local copy)."""
+    f = request.files.get("audio")
+    if f is None:
+        return jsonify({"error": "no audio uploaded"}), 400
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(f.filename or "x.wav").suffix)
+    f.save(tmp.name)
+    tmp.close()
+    try:
+        score = _run_analyzer(tmp.name)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 500
+    finally:
+        try:
+            os.unlink(tmp.name)  # discard audio; keep only the score
+        except OSError:
+            pass
+    sid = uuid.uuid4().hex[:8]
+    _scores[sid] = score
+    return _score_response(sid, score)
+
+
+@app.post("/api/fetch")
+def fetch():
+    """Fetch a song's audio from YouTube (yt-dlp), analyze it, serve it back.
+
+    Never touches Spotify, so there's no account/ban risk. A Spotify link is
+    resolved to its title via the public oEmbed endpoint, then searched.
+    """
+    query = (request.get_json(force=True).get("query") or "").strip()
+    if not query:
+        return jsonify({"error": "empty query"}), 400
+    if "open.spotify.com" in query:
+        try:
+            import requests as rq
+
+            title = rq.get(
+                "https://open.spotify.com/oembed", params={"url": query}, timeout=8
+            ).json().get("title")
+            if title:
+                query = title
+        except Exception:
+            pass
+    base = os.path.join(_VIZ_DIR, uuid.uuid4().hex[:8])
+    opts = {
+        "format": "bestaudio/best",
+        "outtmpl": base + ".%(ext)s",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "default_search": "ytsearch1",
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+        ],
+    }
+    import yt_dlp
+
+    info, last = None, None
+    for _ in range(3):  # YouTube occasionally throttles; retry transient failures
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(query, download=True)
+            break
+        except Exception as exc:
+            last = exc
+            time.sleep(1.5)
+    if info is None:
+        return jsonify({"error": "fetch failed: " + str(last)[-200:]}), 500
+    if "entries" in info:
+        info = info["entries"][0] if info.get("entries") else {}
+    mp3 = base + ".mp3"
+    if not os.path.exists(mp3):
+        return jsonify({"error": "no audio downloaded"}), 500
+    try:
+        score = _run_analyzer(mp3)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 500
+    sid = uuid.uuid4().hex[:8]
+    _scores[sid] = score
+    _audio[sid] = mp3
+    return _score_response(sid, score, audio_url=f"/audio/{sid}", title=info.get("title", query))
+
+
+@app.get("/audio/<sid>")
+def audio(sid):
+    path = _audio.get(sid)
+    if not path or not os.path.exists(path):
+        return ("not found", 404)
+    return send_file(path, mimetype="audio/mpeg")
 
 
 @app.post("/api/timeline")
@@ -305,9 +395,12 @@ VIZ_HTML = """<!doctype html>
  #status{font-size:13px;color:#9c9;min-height:18px}
 </style></head><body>
 <h1>🎚️ Hue visualizer <a href="/" style="font-size:13px">(control panel)</a></h1>
-<div class="row"><label>Drop in a song (wav/mp3/m4a/flac) — analyzed offline, audio stays in your browser</label>
+<div class="row"><label>Drop in a song you have (wav/mp3/m4a/flac) — analyzed offline, audio stays in your browser</label>
  <input type="file" id="file" accept="audio/*"></div>
-<div id="status">Pick a song to analyze.</div>
+<div class="row"><label>…or fetch one you don't have (song name, or YouTube/Spotify link)</label>
+ <input type="text" id="q" placeholder="e.g. Daft Punk Get Lucky" style="width:68%">
+ <button id="fetch" style="padding:7px 14px;border-radius:6px;border:0;background:#37c;color:#fff;cursor:pointer">Fetch</button></div>
+<div id="status">Pick or fetch a song.</div>
 <audio id="aud" controls></audio>
 <canvas id="cv" width="720" height="380"></canvas>
 <div id="ctrls"></div>
@@ -315,17 +408,27 @@ VIZ_HTML = """<!doctype html>
 let sid=null, layout=[], fps=30, frames=null, vals={}, params=[], colors=[], timer=null;
 const $=id=>document.getElementById(id);
 const cv=$('cv'), ctx=cv.getContext('2d'), aud=$('aud');
+function applyAnalysis(d, audioSrc){
+  if(d.error){$('status').textContent='⚠ '+d.error; return;}
+  aud.src=audioSrc; sid=d.score_id; layout=d.layout; params=d.params; colors=d.colors;
+  vals={}; params.forEach(p=>vals[p.name]=p.default);
+  $('status').textContent=(d.title?('“'+d.title+'” · '):'')+
+    `${d.tempo} BPM · ${d.beats_per_bar}/bar · ${d.duration.toFixed(0)}s — press play ▶`;
+  renderControls(); fetchTimeline();
+}
 $('file').onchange=async e=>{
   const file=e.target.files[0]; if(!file)return;
-  aud.src=URL.createObjectURL(file);
-  $('status').textContent='Analyzing (full-song madmom)… first run warms up ~20s.';
+  $('status').textContent='Analyzing (full-song madmom)…';
   const fd=new FormData(); fd.append('audio', file);
-  const r=await fetch('/api/analyze',{method:'POST',body:fd}); const d=await r.json();
-  if(d.error){$('status').textContent='⚠ '+d.error; return;}
-  sid=d.score_id; layout=d.layout; params=d.params; colors=d.colors;
-  vals={}; params.forEach(p=>vals[p.name]=p.default);
-  $('status').textContent=`Tempo ${d.tempo} BPM · ${d.beats_per_bar}/bar · ${d.duration.toFixed(0)}s — press play`;
-  renderControls(); await fetchTimeline();
+  const d=await (await fetch('/api/analyze',{method:'POST',body:fd})).json();
+  applyAnalysis(d, URL.createObjectURL(file));
+};
+$('fetch').onclick=async()=>{
+  const q=$('q').value.trim(); if(!q)return;
+  $('status').textContent='Fetching + analyzing “'+q+'”… (downloading audio)';
+  const d=await (await fetch('/api/fetch',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({query:q})})).json();
+  applyAnalysis(d, d.audio_url);
 };
 async function fetchTimeline(){
   if(!sid)return;

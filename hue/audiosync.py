@@ -15,8 +15,9 @@ BlackHole input device, then `hue beatsync --device BlackHole`.
 
 Usage:
     hue beatsync --list
-    hue beatsync [--device <name|index>] [--sensitivity 1.4] [--gain 6]
-                 [--decay 0.16] [--floor 0.04]
+    hue beatsync [--device <name>] [--color red] [--max-bright 0.22]
+                 [--min-bright 0.04] [--sensitivity 1.6] [--refractory 0.22]
+                 [--decay 0.16] [--gain 0]
 """
 
 import collections
@@ -62,14 +63,14 @@ class BeatDetector:
     refractory period. Also exposes a smoothed level and a bass/treble "tone".
     """
 
-    def __init__(self, samplerate, sensitivity=1.4, decay=0.16, floor=0.04):
+    def __init__(self, samplerate, sensitivity=1.6, refractory=0.22, floor=0.04):
         freqs = np.fft.rfftfreq(BLOCKSIZE, 1.0 / samplerate)
         self._bass = (freqs >= 20) & (freqs <= 150)
         self._treble = freqs >= 2000
         self._window = np.hanning(BLOCKSIZE)
         self._hist = collections.deque(maxlen=int(samplerate / BLOCKSIZE * 0.7))
         self.sensitivity = sensitivity
-        self.refractory = 0.12
+        self.refractory = refractory  # min seconds between beats
         self.floor = floor  # RMS noise gate
         self.level = 0.0  # smoothed RMS (0..~1)
         self.tone = 0.5  # 0 = all bass, 1 = all treble
@@ -120,11 +121,44 @@ def _connect(ip, api_key, client_key):
     return streaming
 
 
-def _lerp(a, b, f):
-    return tuple(a[i] + (b[i] - a[i]) * f for i in range(3))
+_COLORS = {
+    "red": (255, 0, 0),
+    "warm": (255, 80, 15),
+    "amber": (255, 140, 40),
+    "orange": (255, 50, 0),
+    "blue": (40, 90, 255),
+    "green": (0, 255, 40),
+    "purple": (150, 0, 255),
+    "pink": (255, 40, 120),
+    "white": (255, 255, 255),
+}
 
 
-def run(device=None, sensitivity=1.4, gain=6.0, decay=0.16, floor=0.04):
+def _parse_color(spec):
+    """Resolve a color name or 'r,g,b' string to an (r, g, b) tuple."""
+    if isinstance(spec, (tuple, list)):
+        return tuple(spec)
+    s = str(spec).strip().lower()
+    if s in _COLORS:
+        return _COLORS[s]
+    if "," in s:
+        parts = [int(float(x)) for x in s.split(",")][:3]
+        if len(parts) == 3:
+            return tuple(parts)
+    return _COLORS["red"]
+
+
+def run(
+    device=None,
+    sensitivity=1.6,
+    refractory=0.22,
+    decay=0.16,
+    color="red",
+    min_bright=0.04,
+    max_bright=0.22,
+    gain=0.0,
+    floor=0.04,
+):
     """Capture audio and drive the lights on the beat until interrupted."""
     env = dotenv_values(".env")
     ip, api_key, client_key = (
@@ -146,7 +180,8 @@ def run(device=None, sensitivity=1.4, gain=6.0, decay=0.16, floor=0.04):
     channels = min(2, info["max_input_channels"]) or 1
     print(f"Capturing from [{dev}] {info['name']} @ {samplerate}Hz, {channels}ch")
 
-    detector = BeatDetector(samplerate, sensitivity, decay, floor)
+    detector = BeatDetector(samplerate, sensitivity, refractory, floor)
+    rgb = _parse_color(color)
 
     def audio_cb(indata, frames, time_info, status):
         mono = indata.mean(axis=1) if indata.ndim > 1 else indata
@@ -157,8 +192,6 @@ def run(device=None, sensitivity=1.4, gain=6.0, decay=0.16, floor=0.04):
     channel_ids = list(light_to_channel.values())
     print(f"Streaming to {len(channel_ids)} lights. Ctrl-C to stop.")
 
-    WARM = (255, 60, 10)
-    COOL = (40, 120, 255)
     fps = 50
     interval = 1.0 / fps
 
@@ -176,12 +209,16 @@ def run(device=None, sensitivity=1.4, gain=6.0, decay=0.16, floor=0.04):
                 now = time.monotonic()
                 # Beat flash envelope: spike at the beat, exponential decay.
                 env_beat = np.exp(-(now - detector.last_beat) / decay)
-                base = min(0.45, max(0.0, detector.level * gain))  # loudness glow
-                bright = min(1.0, base + env_beat * (1.0 - base))
-                color = _lerp(WARM, COOL, detector.tone)
-                # On a beat, push toward white for a punchy hit.
-                color = _lerp(color, (255, 255, 255), env_beat * 0.5)
-                r, g, b = (c * bright for c in color)
+                # Gentle dim baseline that pulses up to max_bright on each beat
+                # (plus an optional loudness term via gain). Capped low so it
+                # stays easy on the eyes.
+                bright = min(
+                    max_bright,
+                    min_bright
+                    + (max_bright - min_bright) * env_beat
+                    + gain * detector.level,
+                )
+                r, g, b = (c * bright for c in rgb)
 
                 frame = [(cid, r, g, b) for cid in channel_ids]
                 _send_frame(streaming, frame)

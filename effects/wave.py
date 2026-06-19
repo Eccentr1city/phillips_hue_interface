@@ -16,11 +16,11 @@ than the gaps, brightness sags whenever the pulse sits between lights.
 
 Params (all optional):
     angle:   travel direction in degrees, measured off +Y toward +X (default 20).
-    speed:   travel speed in normalized cube units per second (default 0.16).
-    width:   half-width of the bright region in cube units (default 1.2; the
+    speed:   travel speed in normalized cube units per second (default 1.5).
+    width:   half-width of the bright region in cube units (default 2.2; the
              full bright span is 2*width — i.e. the wavelength. Larger = longer,
              broader swell across the room).
-    rest:    seconds the room stays dim between pulses (default 8.0).
+    rest:    seconds the room stays dim between pulses (default 3.0).
     reverse: travel the other direction (default False).
     hot:     [r, g, b] color at the pulse peak (default warm gold).
     cool:    [r, g, b] dim resting color between pulses (default deep indigo).
@@ -38,9 +38,9 @@ def render(
     y: float = 0.0,
     z: float = 0.0,
     angle: float = 20.0,
-    speed: float = 0.16,
-    width: float = 1.2,
-    rest: float = 8.0,
+    speed: float = 1.5,
+    width: float = 2.2,
+    rest: float = 3.0,
     reverse: bool = False,
     hot: tuple = (255, 140, 40),
     cool: tuple = (6, 8, 38),

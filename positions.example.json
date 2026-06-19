@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy to positions.json and fill in your room. Real-world light positions in any consistent unit. Keyed by light name (must match the names on your bridge). apply_positions.py normalizes these into the bridge's -1..1 entertainment cube with a single uniform scale, preserving real proportions.",
+  "units": "meters",
+  "positions": {
+    "Light A": [0.0, 0.0, 1.5],
+    "Light B": [2.0, 0.0, 1.5],
+    "Light C": [1.0, 3.0, 0.9]
+  }
+}

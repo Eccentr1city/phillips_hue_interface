@@ -332,6 +332,7 @@ def run_daemon(config_path: str):
                             new_effects, light_to_channel, light_to_position
                         )
                         _log(f"Reloaded effects: {list(render_map.keys())}")
+                        _log(f"Positions: {light_to_position}")
                     except Exception as exc:
                         _log(f"Reload failed: {exc}")
 

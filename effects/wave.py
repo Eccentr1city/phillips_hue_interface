@@ -1,22 +1,22 @@
 """Spatial wave — a soft pulse drifts across the room, then it rests dim, repeat.
 
 Position-aware: uses each light's real (x, y, z) coordinate so one broad pulse of
-light travels through physical space along an axis, fully enters and exits, and
-then the whole room rests at the dim `cool` color for a gap before the next.
+light travels through physical space, fully enters and exits, and then the whole
+room rests at the dim `cool` color for a gap before the next.
+
+The travel direction lives in the x-y (floor) plane and is set by `angle`:
+0 deg travels along +Y, 90 deg along +X, so e.g. 20 deg is mostly along Y but
+tilted toward X. Because positions were normalized with a single uniform scale,
+this angle matches the real physical angle in the room.
 
 The pulse is a raised-cosine bump (compact support, smoothly zero at its edges),
 so it fades in and out with no pop. Make `width` comparable to the spacing
-between your lights along the travel axis: if the bright region is narrower than
-the gaps, brightness sags whenever the pulse sits between lights.
-
-Timeline per cycle:
-    [0 .. transit)        one pulse travels across the room (transit is derived:
-                          the distance to cross at `speed`)
-    [transit .. +rest)    whole room rests at `cool` (the dim gap)
+between your lights along the travel direction: if the bright region is narrower
+than the gaps, brightness sags whenever the pulse sits between lights.
 
 Params (all optional):
-    axis:    "x" | "y" | "z" — axis the pulse travels along (default "y").
-    speed:   travel speed in normalized cube units per second (default 0.125).
+    angle:   travel direction in degrees, measured off +Y toward +X (default 20).
+    speed:   travel speed in normalized cube units per second (default 0.16).
     width:   half-width of the bright region in cube units (default 0.7; the
              full bright span is 2*width).
     rest:    seconds the room stays dim between pulses (default 8.0).
@@ -33,8 +33,8 @@ def render(
     x: float = 0.0,
     y: float = 0.0,
     z: float = 0.0,
-    axis: str = "y",
-    speed: float = 0.125,
+    angle: float = 20.0,
+    speed: float = 0.16,
     width: float = 0.7,
     rest: float = 8.0,
     reverse: bool = False,
@@ -42,11 +42,15 @@ def render(
     cool: tuple = (6, 8, 38),
     **params,
 ) -> tuple[float, float, float]:
-    coord = {"x": x, "y": y, "z": z}.get(axis, y)
+    # Signed distance of this light along the (tilted) travel direction.
+    a = math.radians(angle)
+    dir_x, dir_y = math.sin(a), math.cos(a)
+    coord = x * dir_x + y * dir_y
 
-    # The pulse center travels from one width beyond -1 to one width beyond +1,
-    # so it fully enters and exits the [-1, 1] span of light positions.
-    span = 2.0 + 2.0 * width
+    # Largest |coord| any point in the unit floor-cube can have for this
+    # direction — so the pulse fully covers every light as it crosses.
+    bound = abs(dir_x) + abs(dir_y)
+    span = 2.0 * bound + 2.0 * width
     transit = span / speed
     period = transit + rest
 
@@ -56,7 +60,7 @@ def render(
         p = cycle / transit  # 0..1 progress
         if reverse:
             p = 1.0 - p
-        front = (-1.0 - width) + p * span
+        front = -(bound + width) + p * span
         d = coord - front
         if abs(d) < width:
             # Raised-cosine bump: 1 at the center, smoothly 0 at d = +/-width.

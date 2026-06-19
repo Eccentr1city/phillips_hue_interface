@@ -17,8 +17,9 @@ than the gaps, brightness sags whenever the pulse sits between lights.
 Params (all optional):
     angle:   travel direction in degrees, measured off +Y toward +X (default 20).
     speed:   travel speed in normalized cube units per second (default 0.16).
-    width:   half-width of the bright region in cube units (default 0.7; the
-             full bright span is 2*width).
+    width:   half-width of the bright region in cube units (default 1.2; the
+             full bright span is 2*width — i.e. the wavelength. Larger = longer,
+             broader swell across the room).
     rest:    seconds the room stays dim between pulses (default 8.0).
     reverse: travel the other direction (default False).
     hot:     [r, g, b] color at the pulse peak (default warm gold).
@@ -26,6 +27,9 @@ Params (all optional):
 """
 
 import math
+
+# Prefer the smooth (REST firmware-fade) backend — this is a slow ambient effect.
+MODE = "smooth"
 
 
 def render(
@@ -35,7 +39,7 @@ def render(
     z: float = 0.0,
     angle: float = 20.0,
     speed: float = 0.16,
-    width: float = 0.7,
+    width: float = 1.2,
     rest: float = 8.0,
     reverse: bool = False,
     hot: tuple = (255, 140, 40),

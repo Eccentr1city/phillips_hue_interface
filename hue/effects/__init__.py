@@ -26,6 +26,9 @@ def _load_effect_from_file(path: Path) -> dict | None:
         "render": render_fn,
         "builtin": _BUILTIN_DIR in path.parents or path.parent == _BUILTIN_DIR,
         "description": (mod.__doc__ or "").strip(),
+        # Preferred rendering backend: "smooth" (REST fades) or "streaming".
+        # The CLI uses this when no --smooth/--stream flag is given.
+        "mode": getattr(mod, "MODE", None),
     }
 
 

@@ -38,10 +38,11 @@ def _print_help():
     print(
         "  set <lights> --color <color>    Set color (and optionally --brightness 0-1)"
     )
-    print("  set <lights> --effect <name>    Start an effect (streaming)")
+    print("  set <lights> --effect <name>    Start an effect (mode per effect)")
     print(
-        "  set <lights> --effect <name> --smooth    Smooth mode (REST fades; "
-        "good for slow effects; --interval/--transition tunable)"
+        "       [--smooth | --stream]      Force smooth (REST firmware fades) or "
+        "streaming. Smooth takes --interval/--transition; effect params (e.g. "
+        "--speed, --width) pass through as flags."
     )
     print("  on [lights]                     Turn on (default: all)")
     print("  off [lights]                    Turn off (default: all)")
@@ -105,9 +106,10 @@ def _cmd_set(args: list[str]):
         print("Usage: hue set <lights> --color <color> [--brightness <0-1>]")
         sys.exit(1)
 
-    # --smooth is a bare boolean flag; pull it out before parsing key/value flags.
-    smooth = "--smooth" in args
-    args = [a for a in args if a != "--smooth"]
+    # Bare boolean flags forcing a rendering mode; pull them out first.
+    force_smooth = "--smooth" in args
+    force_stream = "--stream" in args
+    args = [a for a in args if a not in ("--smooth", "--stream")]
 
     target = _parse_lights_target(args[0])
     flags = _parse_flags(args[1:])
@@ -119,7 +121,15 @@ def _cmd_set(args: list[str]):
     if effect_name:
         from hue.effects import get_effect
 
-        get_effect(effect_name)  # validate
+        eff = get_effect(effect_name)  # validate
+
+        # Mode: explicit flag wins, else the effect's declared MODE, else stream.
+        if force_smooth:
+            mode = "smooth"
+        elif force_stream:
+            mode = "streaming"
+        else:
+            mode = eff.get("mode") or "streaming"
 
         # Any flags other than the reserved ones are passed to the effect as
         # params (e.g. --speed 0.3 --width 0.5), numbers when parseable.
@@ -140,7 +150,7 @@ def _cmd_set(args: list[str]):
         }
         names = ", ".join(lt.name for lt in resolved)
 
-        if smooth:
+        if mode == "smooth":
             # Smooth (REST + firmware fades) — for slow ambient effects.
             from hue.smooth import start_smooth
             from hue.stream import stop_stream

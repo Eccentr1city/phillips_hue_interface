@@ -13,6 +13,7 @@ Config file format (.hue_stream_config.json):
 }
 """
 
+import inspect
 import json
 import os
 import signal
@@ -33,6 +34,20 @@ def _log(msg: str):
     """Append a line to the stream log file for debugging."""
     with open(LOG_FILE, "a") as f:
         f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+
+
+def _unlink_pid_if_mine(pid: int):
+    """Remove the PID file only if it still names ``pid``.
+
+    Guards against a slow-exiting old daemon deleting a newer daemon's PID file
+    during a restart (both share PID_FILE), which would orphan the live daemon
+    and let a second one spawn and fight over the bridge's single DTLS slot.
+    """
+    try:
+        if PID_FILE.read_text().strip() == str(pid):
+            PID_FILE.unlink()
+    except (FileNotFoundError, ValueError):
+        pass
 
 
 def get_running_pid() -> int | None:
@@ -60,18 +75,17 @@ def stop_stream():
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
-        try:
-            PID_FILE.unlink()
-        except FileNotFoundError:
-            pass
+        _unlink_pid_if_mine(pid)
         return True
 
-    # Wait for graceful shutdown
-    for _ in range(30):
+    # Wait for graceful shutdown — DTLS teardown can take several seconds.
+    died = False
+    for _ in range(100):  # up to ~10s
         try:
             os.kill(pid, 0)
             time.sleep(0.1)
         except ProcessLookupError:
+            died = True
             break
 
     try:
@@ -79,10 +93,10 @@ def stop_stream():
     except ChildProcessError:
         pass
 
-    try:
-        PID_FILE.unlink()
-    except FileNotFoundError:
-        pass
+    # Only clear the PID file if the daemon actually exited; otherwise leave it
+    # so the still-live daemon stays tracked and no second daemon can spawn.
+    if died:
+        _unlink_pid_if_mine(pid)
     return True
 
 
@@ -97,8 +111,15 @@ def _write_config(bridge_ip: str, api_key: str, client_key: str, light_effects: 
     CONFIG_FILE.write_text(json.dumps(config_data))
 
 
-def _build_light_to_channel_map(bridge_ip: str, api_key: str) -> dict[int, int]:
-    """Build a mapping from v1 light IDs to entertainment channel IDs."""
+def _build_channel_maps(
+    bridge_ip: str, api_key: str
+) -> tuple[dict[int, int], dict[int, dict]]:
+    """Map v1 light IDs to entertainment channel IDs and 3D positions.
+
+    Returns:
+        (light_to_channel, light_to_position) where position is
+        {"x": float, "y": float, "z": float} in the bridge's -1..1 cube.
+    """
     headers = {"hue-application-key": api_key}
     base = f"https://{bridge_ip}"
 
@@ -123,36 +144,76 @@ def _build_light_to_channel_map(bridge_ip: str, api_key: str) -> dict[int, int]:
     )
     configs = resp.json().get("data", [])
     if not configs:
-        return {}
+        return {}, {}
 
     config = configs[0]
-    channel_to_ent_rid: dict[int, str] = {}
-    for channel in config.get("channels", []):
-        cid = channel["channel_id"]
-        members = channel.get("members", [])
-        if members:
-            channel_to_ent_rid[cid] = members[0]["service"]["rid"]
-
     light_to_channel: dict[int, int] = {}
-    for cid, ent_rid in channel_to_ent_rid.items():
-        v1_id = ent_rid_to_v1.get(ent_rid)
-        if v1_id is not None:
-            light_to_channel[v1_id] = cid
+    light_to_position: dict[int, dict] = {}
+    for channel in config.get("channels", []):
+        members = channel.get("members", [])
+        if not members:
+            continue
+        v1_id = ent_rid_to_v1.get(members[0]["service"]["rid"])
+        if v1_id is None:
+            continue
+        light_to_channel[v1_id] = channel["channel_id"]
+        pos = channel.get("position") or {}
+        light_to_position[v1_id] = {
+            "x": float(pos.get("x", 0.0)),
+            "y": float(pos.get("y", 0.0)),
+            "z": float(pos.get("z", 0.0)),
+        }
 
-    return light_to_channel
+    return light_to_channel, light_to_position
 
 
-def _resolve_effects(light_effects: dict[int, dict]) -> dict[int, dict]:
-    """Resolve effect names to render functions."""
+def _effect_kwargs(
+    render_fn, phase: float, position: dict | None, user_params: dict
+) -> dict:
+    """Build the static kwargs for an effect's render(), filtered to its signature.
+
+    User params are always passed. The auto-injected ``phase`` and positional
+    ``x``/``y``/``z`` are added only if the effect's signature accepts them (by
+    name or via **kwargs), so position-naive effects keep working unchanged.
+    """
+    sig = inspect.signature(render_fn)
+    has_var_kw = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+    accepted = set(sig.parameters)
+
+    kwargs = dict(user_params)
+    auto = {"phase": phase}
+    if position is not None:
+        auto["x"] = position["x"]
+        auto["y"] = position["y"]
+        auto["z"] = position["z"]
+    for key, value in auto.items():
+        if key in kwargs:
+            continue
+        if has_var_kw or key in accepted:
+            kwargs[key] = value
+    return kwargs
+
+
+def _resolve_effects(
+    light_effects: dict[int, dict],
+    light_to_channel: dict[int, int],
+    light_to_position: dict[int, dict],
+) -> dict[int, dict]:
+    """Resolve effect names to render functions with precomputed static kwargs."""
     from hue.effects import get_effect
 
     render_map: dict[int, dict] = {}
     for light_id, info in light_effects.items():
         eff = get_effect(info["effect"])
-        render_map[light_id] = {
-            "render": eff["render"],
-            "params": info.get("params", {}),
-        }
+        channel_id = light_to_channel.get(light_id)
+        phase = float(channel_id) if channel_id is not None else float(light_id)
+        kwargs = _effect_kwargs(
+            eff["render"],
+            phase,
+            light_to_position.get(light_id),
+            info.get("params", {}),
+        )
+        render_map[light_id] = {"render": eff["render"], "kwargs": kwargs}
     return render_map
 
 
@@ -172,7 +233,6 @@ def run_daemon(config_path: str):
     light_effects = {
         int(lid): info for lid, info in config_data["light_effects"].items()
     }
-    render_map = _resolve_effects(light_effects)
 
     # SIGUSR1 handler: reload config and swap effects (no DTLS reconnect)
     reload_flag = [False]
@@ -182,9 +242,11 @@ def run_daemon(config_path: str):
 
     signal.signal(signal.SIGUSR1, _on_reload)
 
-    # Build channel map
-    light_to_channel = _build_light_to_channel_map(bridge_ip, api_key)
+    # Build channel + position maps, then resolve effects against them
+    light_to_channel, light_to_position = _build_channel_maps(bridge_ip, api_key)
     _log(f"Channel map: {light_to_channel}")
+    _log(f"Positions: {light_to_position}")
+    render_map = _resolve_effects(light_effects, light_to_channel, light_to_position)
 
     # Set up DTLS connection
     bridge = hep.create_bridge(
@@ -202,7 +264,7 @@ def run_daemon(config_path: str):
     configs = ent.get_entertainment_configs()
     if not configs:
         _log("ERROR: No entertainment areas configured on bridge")
-        PID_FILE.unlink(missing_ok=True)
+        _unlink_pid_if_mine(os.getpid())
         sys.exit(1)
 
     config_id = list(configs.keys())[0]
@@ -263,9 +325,11 @@ def run_daemon(config_path: str):
                             int(lid): info
                             for lid, info in new_data["light_effects"].items()
                         }
-                        render_map = _resolve_effects(new_effects)
-                        light_to_channel = _build_light_to_channel_map(
+                        light_to_channel, light_to_position = _build_channel_maps(
                             bridge_ip, api_key
+                        )
+                        render_map = _resolve_effects(
+                            new_effects, light_to_channel, light_to_position
                         )
                         _log(f"Reloaded effects: {list(render_map.keys())}")
                     except Exception as exc:
@@ -276,11 +340,7 @@ def run_daemon(config_path: str):
                     channel_id = light_to_channel.get(light_id)
                     if channel_id is None:
                         continue
-                    render_fn = effect_info["render"]
-                    params = effect_info.get("params", {})
-                    if "phase" not in params:
-                        params = {**params, "phase": float(channel_id)}
-                    r, g, b = render_fn(t, **params)
+                    r, g, b = effect_info["render"](t, **effect_info["kwargs"])
                     streaming.set_input((r, g, b, channel_id))
 
                 elapsed = time.monotonic() - start_time - t
@@ -304,7 +364,7 @@ def run_daemon(config_path: str):
         streaming.stop_stream()
     except Exception:
         pass
-    PID_FILE.unlink(missing_ok=True)
+    _unlink_pid_if_mine(os.getpid())
     _log("Daemon stopped")
 
 

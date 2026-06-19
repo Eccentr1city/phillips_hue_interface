@@ -16,6 +16,7 @@ Config file format (.hue_stream_config.json):
 import inspect
 import json
 import os
+import random
 import signal
 import struct
 import subprocess
@@ -24,6 +25,12 @@ import time
 from pathlib import Path
 
 import requests
+
+# Temporal-dither depth, in 16-bit color units. Adds a small triangular-PDF
+# noise (about +/- one 8-bit level) before quantization so the bulb's coarse
+# brightness levels get averaged out by the eye across frames — this is what
+# removes visible stepping on slow fades. Set to 0 to disable dithering.
+DITHER = 256.0
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 PID_FILE = PROJECT_DIR / ".hue_stream.pid"
@@ -198,11 +205,18 @@ def _effect_kwargs(
 def _u16(v: float) -> int:
     """Scale a 0..255 (possibly fractional) color value to a 0..65535 uint16.
 
-    Effects compute in floating point, so feeding the bridge real 16-bit values
-    (65536 levels) instead of 8-bit (256 levels) is what makes slow fades smooth
-    — at 8 bits the bulb visibly holds each discrete step through the dim parts.
+    Effects compute in floating point, so we feed the bridge real 16-bit values
+    (65536 levels) instead of 8-bit. On top of that we add triangular-PDF dither
+    (~+/- one 8-bit level): the bulb resolves only so many brightness levels, and
+    without dither a slow fade visibly holds each level then jumps. The noise
+    randomizes which level the bulb lands on each frame, so the eye averages it
+    into a smooth ramp. The noise is far too small/fast to read as flicker.
     """
-    iv = int(v * 257.0 + 0.5)  # 257 == 65535 / 255
+    if DITHER:
+        v = v * 257.0 + (random.random() + random.random() - 1.0) * DITHER
+    else:
+        v = v * 257.0
+    iv = int(v + 0.5)  # 257 == 65535 / 255
     return 0 if iv < 0 else 65535 if iv > 65535 else iv
 
 
@@ -350,6 +364,7 @@ def run_daemon(config_path: str):
 
         # Render loop — runs until error or shutdown
         start_time = time.monotonic()
+        next_frame = start_time
         try:
             while not shutdown_flag[0]:
                 # Check for config reload
@@ -383,10 +398,15 @@ def run_daemon(config_path: str):
                 if frame:
                     _send_frame(streaming, frame)
 
-                elapsed = time.monotonic() - start_time - t
-                sleep_time = interval - elapsed
+                # Pace to an absolute schedule so packets are evenly spaced
+                # (sleep-the-remainder drifts and jitters frame to frame).
+                next_frame += interval
+                sleep_time = next_frame - time.monotonic()
                 if sleep_time > 0:
                     time.sleep(sleep_time)
+                else:
+                    # Fell behind — resync rather than spiral into catch-up.
+                    next_frame = time.monotonic()
         except Exception as exc:
             _log(f"Render loop error: {exc}, will reconnect")
 

@@ -271,9 +271,10 @@ def _cmd_beatsync(args: list[str]):
     flags = _parse_flags(args)
     run(
         device=flags.get("device"),
-        sensitivity=float(flags.get("sensitivity", 1.6)),
-        refractory=float(flags.get("refractory", 0.22)),
-        decay=float(flags.get("decay", 0.16)),
+        sensitivity=float(flags.get("sensitivity", 1.7)),
+        refractory=float(flags.get("refractory", 0.34)),
+        decay=float(flags.get("decay", 0.30)),
+        attack=float(flags.get("attack", 0.12)),
         color=flags.get("color", "red"),
         min_bright=float(flags.get("min-bright", 0.04)),
         max_bright=float(flags.get("max-bright", 0.22)),

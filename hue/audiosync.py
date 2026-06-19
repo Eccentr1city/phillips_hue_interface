@@ -16,8 +16,8 @@ BlackHole input device, then `hue beatsync --device BlackHole`.
 Usage:
     hue beatsync --list
     hue beatsync [--device <name>] [--color red] [--max-bright 0.22]
-                 [--min-bright 0.04] [--sensitivity 1.6] [--refractory 0.22]
-                 [--decay 0.16] [--gain 0]
+                 [--min-bright 0.04] [--sensitivity 1.7] [--refractory 0.34]
+                 [--decay 0.30] [--attack 0.12] [--gain 0]
 """
 
 import collections
@@ -65,7 +65,8 @@ class BeatDetector:
 
     def __init__(self, samplerate, sensitivity=1.6, refractory=0.22, floor=0.04):
         freqs = np.fft.rfftfreq(BLOCKSIZE, 1.0 / samplerate)
-        self._bass = (freqs >= 20) & (freqs <= 150)
+        # Narrow to the kick/deep-bass band so it tracks the low end, not snares.
+        self._bass = (freqs >= 30) & (freqs <= 120)
         self._treble = freqs >= 2000
         self._window = np.hanning(BLOCKSIZE)
         self._hist = collections.deque(maxlen=int(samplerate / BLOCKSIZE * 0.7))
@@ -150,9 +151,10 @@ def _parse_color(spec):
 
 def run(
     device=None,
-    sensitivity=1.6,
-    refractory=0.22,
-    decay=0.16,
+    sensitivity=1.7,
+    refractory=0.34,
+    decay=0.30,
+    attack=0.12,
     color="red",
     min_bright=0.04,
     max_bright=0.22,
@@ -194,6 +196,10 @@ def run(
 
     fps = 50
     interval = 1.0 / fps
+    # Low-pass coefficient for smoothing the brightness signal: larger `attack`
+    # (seconds) => gentler rise/fall, so beats read as swells, not flashes.
+    smooth_k = 1.0 - np.exp(-interval / max(1e-3, attack))
+    smooth_env = 0.0
 
     stream = sd.InputStream(
         device=dev,
@@ -207,15 +213,16 @@ def run(
             next_frame = time.monotonic()
             while True:
                 now = time.monotonic()
-                # Beat flash envelope: spike at the beat, exponential decay.
+                # Per-beat spike (exp decay), then low-passed into a smooth swell.
                 env_beat = np.exp(-(now - detector.last_beat) / decay)
-                # Gentle dim baseline that pulses up to max_bright on each beat
+                smooth_env += (env_beat - smooth_env) * smooth_k
+                # Gentle dim baseline that swells up toward max_bright on beats
                 # (plus an optional loudness term via gain). Capped low so it
                 # stays easy on the eyes.
                 bright = min(
                     max_bright,
                     min_bright
-                    + (max_bright - min_bright) * env_beat
+                    + (max_bright - min_bright) * smooth_env
                     + gain * detector.level,
                 )
                 r, g, b = (c * bright for c in rgb)

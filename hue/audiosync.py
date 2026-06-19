@@ -54,21 +54,24 @@ DEFAULTS = {
     "min_bright": 0.04,
     "max_bright": 0.22,
     "flavor_max": 0.10,
-    "pulse_scale": 1.3,
+    "flavor_sensitivity": 1.5,
     "gain": 0.0,
+    # Fallback energy-follow tuning (used only before the beat grid locks);
+    # not exposed in the UI. sensitivity/refractory are set above.
+    "pulse_scale": 1.3,
     "floor": 0.04,
 }
 
-# Slider/param spec for the web UI.
+# Slider/param spec for the web UI. The anchor is driven by the librosa beat
+# grid, so its shape is attack/decay; sensitivity/pulse_scale only affect the
+# pre-lock fallback and are intentionally omitted here.
 PARAMS = [
     {"name": "max_bright", "label": "Anchor brightness", "min": 0.02, "max": 0.6, "step": 0.01},
     {"name": "flavor_max", "label": "Flavor brightness", "min": 0.0, "max": 0.4, "step": 0.01},
     {"name": "min_bright", "label": "Baseline glow", "min": 0.0, "max": 0.2, "step": 0.005},
-    {"name": "attack", "label": "Attack (s)", "min": 0.02, "max": 0.5, "step": 0.01},
-    {"name": "decay", "label": "Release (s)", "min": 0.05, "max": 1.0, "step": 0.01},
-    {"name": "pulse_scale", "label": "Bass pulse scale", "min": 0.3, "max": 3.0, "step": 0.05},
-    {"name": "sensitivity", "label": "Flavor sensitivity", "min": 1.05, "max": 3.0, "step": 0.05},
-    {"name": "refractory", "label": "Anchor refractory (s)", "min": 0.05, "max": 0.8, "step": 0.01},
+    {"name": "attack", "label": "Beat attack (s)", "min": 0.02, "max": 0.5, "step": 0.01},
+    {"name": "decay", "label": "Beat sustain (s)", "min": 0.05, "max": 1.0, "step": 0.01},
+    {"name": "flavor_sensitivity", "label": "Flavor sensitivity", "min": 1.05, "max": 3.0, "step": 0.05},
     {"name": "gain", "label": "Loudness glow", "min": 0.0, "max": 5.0, "step": 0.1},
     {"name": "color", "label": "Anchor color", "type": "color"},
     {"name": "flavor_color", "label": "Flavor color", "type": "color"},
@@ -274,7 +277,7 @@ class BeatTracker:
         return (now - self.beat_ref) % self.period
 
 
-def _connect(ip, api_key, client_key):
+def _connect(ip, api_key, client_key, stop_event=None):
     import hue_entertainment_pykit as hep
 
     bridge = hep.create_bridge(
@@ -292,10 +295,23 @@ def _connect(ip, api_key, client_key):
     if not configs:
         raise RuntimeError("No entertainment area on the bridge.")
     config_id = list(configs.keys())[0]
-    streaming = hep.Streaming(bridge, configs[config_id], ent.get_ent_conf_repo())
-    streaming.set_color_space("rgb")
-    streaming.start_stream()
-    return streaming
+    cfg = configs[config_id]
+    repo = ent.get_ent_conf_repo()
+    # The bridge allows one entertainment session and is slow to free it, so the
+    # DTLS handshake can time out transiently — retry with backoff.
+    last = None
+    for _ in range(5):
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("stopped before connect")
+        streaming = hep.Streaming(bridge, cfg, repo)
+        streaming.set_color_space("rgb")
+        try:
+            streaming.start_stream()
+            return streaming
+        except Exception as exc:
+            last = exc
+            time.sleep(2)
+    raise RuntimeError(f"DTLS handshake failed after retries: {last}")
 
 
 class BeatSyncEngine:
@@ -307,9 +323,18 @@ class BeatSyncEngine:
         self._thread = None
         self._stop = threading.Event()
         self.error = None
+        self._tracker = None
 
     def is_running(self):
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def bpm(self):
+        return self._tracker.bpm if (self.is_running() and self._tracker) else 0.0
+
+    @property
+    def locked(self):
+        return bool(self.is_running() and self._tracker and self._tracker.ready)
 
     def set_params(self, **kw):
         with self._lock:
@@ -365,6 +390,7 @@ class BeatSyncEngine:
             samplerate, *FLAVOR_BAND, FLAVOR_SENSITIVITY, FLAVOR_REFRACTORY, p["floor"]
         )
         tracker = BeatTracker(samplerate)
+        self._tracker = tracker
         tracker.start()
 
         def audio_cb(indata, frames, time_info, status):
@@ -375,7 +401,7 @@ class BeatSyncEngine:
             flav.process(m, now)
             tracker.push(m, now)
 
-        streaming = _connect(ip, api_key, client_key)
+        streaming = _connect(ip, api_key, client_key, stop_event=self._stop)
         light_to_channel, _ = _build_channel_maps(ip, api_key)
         all_channels = sorted(light_to_channel.values())
         lights = requests.get(
@@ -411,6 +437,7 @@ class BeatSyncEngine:
                 bass.sensitivity = p["sensitivity"]
                 bass.refractory = p["refractory"]
                 bass.floor = flav.floor = p["floor"]
+                flav.sensitivity = p["flavor_sensitivity"]
                 bass_rgb = _parse_color(p["color"])
                 flav_rgb = _parse_color(p["flavor_color"])
                 attack_k = 1.0 - np.exp(-interval / max(1e-3, p["attack"]))

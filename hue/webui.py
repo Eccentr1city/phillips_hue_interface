@@ -71,6 +71,8 @@ def state():
             "devices": input_devices(),
             "colors": list(COLORS.keys()),
             "running": "beatsync" if _engine.is_running() else None,
+            "bpm": round(_engine.bpm, 1),
+            "locked": _engine.locked,
             "error": _engine.error,
         }
     )
@@ -194,7 +196,13 @@ function status(err){const s=$('status');if(err){s.textContent='⚠ '+err;s.clas
 $('prog').onchange=render;
 $('start').onclick=()=>{activeId=cur().id;apply();status();};
 $('stop').onclick=async()=>{activeId=null;await fetch('/api/stop',{method:'POST'});status();};
-setInterval(async()=>{if(activeId==='beatsync'){const st=await (await fetch('/api/state')).json();if(st.error)status(st.error);}},2500);
+setInterval(async()=>{
+  if(activeId!=='beatsync')return;
+  const st=await (await fetch('/api/state')).json();
+  if(st.error){status(st.error);return;}
+  const s=$('status');s.className='';
+  s.textContent='▶ beatsync — '+(st.locked?('♪ '+st.bpm+' BPM'):'listening / warming up…');
+},1000);
 load();
 </script></body></html>
 """

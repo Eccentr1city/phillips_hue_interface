@@ -17,6 +17,7 @@ import inspect
 import json
 import os
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -194,6 +195,34 @@ def _effect_kwargs(
     return kwargs
 
 
+def _send_frame(streaming, frame: list[tuple[int, int, int, int]]):
+    """Send one DTLS packet containing ALL channels for this frame.
+
+    The pykit ``set_input`` queues each channel and its worker thread sends a
+    separate single-channel packet per color — at N lights x F fps that's N*F
+    messages/sec, which overruns the bridge's streaming rate and makes lights
+    update one-at-a-time (visible stutter). The Hue Entertainment protocol wants
+    one message per frame carrying every channel, so we build and send that
+    directly via the streaming service's socket and message builder.
+
+    Each channel is 7 bytes: 1-byte channel id + three big-endian uint16 colors.
+    ``_last_message`` is updated so the keep-alive thread re-sends a full frame.
+    """
+    svc = streaming._streaming_service
+    channel_data = b""
+    for channel_id, r, g, b in frame:
+        channel_data += struct.pack(
+            ">BHHH",
+            channel_id,
+            (r * 65535) // 255,
+            (g * 65535) // 255,
+            (b * 65535) // 255,
+        )
+    message = svc._build_message(channel_data)
+    svc._dtls_service.get_socket().send(message)
+    svc._last_message = message
+
+
 def _resolve_effects(
     light_effects: dict[int, dict],
     light_to_channel: dict[int, int],
@@ -282,7 +311,9 @@ def run_daemon(config_path: str):
     signal.signal(signal.SIGINT, _on_shutdown)
 
     # Outer loop: auto-reconnect on DTLS errors (bridge reboot, network blip, etc.)
-    fps = 25
+    # One full-frame packet per frame keeps us within the bridge's streaming rate
+    # even at 50fps, so motion is smooth.
+    fps = 50
     interval = 1.0 / fps
 
     while not shutdown_flag[0]:
@@ -337,12 +368,15 @@ def run_daemon(config_path: str):
                         _log(f"Reload failed: {exc}")
 
                 t = time.monotonic() - start_time
+                frame = []
                 for light_id, effect_info in render_map.items():
                     channel_id = light_to_channel.get(light_id)
                     if channel_id is None:
                         continue
                     r, g, b = effect_info["render"](t, **effect_info["kwargs"])
-                    streaming.set_input((r, g, b, channel_id))
+                    frame.append((channel_id, r, g, b))
+                if frame:
+                    _send_frame(streaming, frame)
 
                 elapsed = time.monotonic() - start_time - t
                 sleep_time = interval - elapsed

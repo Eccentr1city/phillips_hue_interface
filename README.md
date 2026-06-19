@@ -127,6 +127,27 @@ kill $(cat .hue_stream.pid 2>/dev/null); rm -f .hue_stream.pid
 **DTLS handshake fails:**
 The bridge only allows one entertainment session. If another app holds the session, the daemon will retry 5 times with backoff. If all attempts fail, it waits 10 seconds and tries again indefinitely.
 
+**Daemon dies instantly with `mbedtls ... size changed, may indicate binary incompatibility`:**
+The DTLS stack (`hue_entertainment_pykit` → `python-mbedtls`) is a Cython
+extension that must be compiled against the *same* mbedtls C library it loads at
+runtime. `python-mbedtls` has no wheels for some platforms (e.g. macOS arm64 /
+Python 3.13), so it builds from source — and if multiple mbedtls versions are
+installed (common with Homebrew: `mbedtls`, `mbedtls@2`, `mbedtls@3`), the build
+can pick up headers from one version and link a different one, producing this
+ABI mismatch. Rebuild it from source pinned to a single mbedtls (mbedtls 2.x):
+
+```bash
+# macOS / Homebrew:
+brew install mbedtls@2
+M2=/opt/homebrew/opt/mbedtls@2
+CFLAGS="-I$M2/include" LDFLAGS="-L$M2/lib" \
+  uv pip install --no-cache --no-binary python-mbedtls --reinstall-package python-mbedtls python-mbedtls
+```
+
+The daemon log (`.hue_stream.log`) won't show this — it crashes before logging,
+since the parent spawns it with stderr discarded. Reproduce the real traceback
+with `uv run python -m hue.stream .hue_stream_config.json`.
+
 ## Scenes
 
 Scenes are JSON files in `scenes/` mapping light IDs to configurations. They can include static colors and/or streaming effects.

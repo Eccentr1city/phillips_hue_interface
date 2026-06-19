@@ -6,8 +6,16 @@ applies changes live: effects hot-reload their daemon, beatsync updates its
 in-process engine. Start/Stop and a device picker for beatsync are included.
 """
 
+import os
+import subprocess
+import tempfile
+import uuid
+from pathlib import Path
+
 from flask import Flask, Response, jsonify, request
 
+from hue import score as score_mod
+from hue.audiosync import BEATENV_PY, PROJECT_DIR
 from hue.audiosync import DEFAULTS as BEAT_DEFAULTS
 from hue.audiosync import PARAMS as BEAT_PARAMS
 from hue.audiosync import BeatSyncEngine, input_devices
@@ -16,6 +24,8 @@ from hue.audiosync import _COLORS as COLORS
 app = Flask(__name__)
 _engine = BeatSyncEngine()
 _bridge = None
+_scores = {}  # score_id -> light score
+_layout = None  # cached light layout (positions + names)
 
 
 def _get_bridge():
@@ -122,9 +132,83 @@ def index():
     return Response(INDEX_HTML, mimetype="text/html")
 
 
+def _ensure_layout():
+    # From positions.json — no bridge needed, so the visualizer works away from home.
+    global _layout
+    if _layout is None:
+        _layout = score_mod.build_layout()
+    return _layout
+
+
+@app.post("/api/analyze")
+def analyze():
+    """Accept an uploaded audio file, analyze it offline, return a light score."""
+    if not BEATENV_PY.exists():
+        return jsonify({"error": "Run `hue beatsetup` first (.beatenv missing)."}), 400
+    f = request.files.get("audio")
+    if f is None:
+        return jsonify({"error": "no audio uploaded"}), 400
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(f.filename or "x.wav").suffix)
+    f.save(tmp.name)
+    tmp.close()
+    out = tmp.name + ".score.json"
+    proc = subprocess.run(
+        [str(BEATENV_PY), str(PROJECT_DIR / "analyze_offline.py"), tmp.name, out],
+        capture_output=True,
+        text=True,
+    )
+    for path in (tmp.name,):  # discard the audio; keep only the score
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if proc.returncode != 0 or not os.path.exists(out):
+        tail = (proc.stderr or "")[-300:]
+        return jsonify({"error": f"analysis failed: {tail}"}), 500
+    score = score_mod.load_score(out)
+    os.unlink(out)
+    sid = uuid.uuid4().hex[:8]
+    _scores[sid] = score
+    params = []
+    for spec in score_mod.PARAMS:
+        spec = dict(spec)
+        spec.setdefault("type", "float")
+        spec.setdefault("label", spec["name"])
+        spec["default"] = score_mod.DEFAULTS.get(spec["name"])
+        params.append(spec)
+    return jsonify(
+        {
+            "score_id": sid,
+            "layout": _ensure_layout(),
+            "params": params,
+            "colors": list(COLORS.keys()),
+            "duration": score["duration"],
+            "tempo": score["tempo"],
+            "beats_per_bar": score["beats_per_bar"],
+        }
+    )
+
+
+@app.post("/api/timeline")
+def timeline():
+    data = request.get_json(force=True)
+    score = _scores.get(data.get("score_id"))
+    if not score:
+        return jsonify({"error": "unknown score_id"}), 404
+    fps = 30
+    frames = score_mod.render_timeline(score, data.get("params", {}), _ensure_layout(), fps)
+    return jsonify({"fps": fps, "frames": frames})
+
+
+@app.get("/viz")
+def viz():
+    return Response(VIZ_HTML, mimetype="text/html")
+
+
 def serve(port=8765):
     url = f"http://127.0.0.1:{port}"
-    print(f"Hue control panel: {url}  (Ctrl-C to stop)")
+    print(f"Hue control panel: {url}")
+    print(f"Song visualizer:   {url}/viz   (Ctrl-C to stop)")
     app.run(host="127.0.0.1", port=port, threaded=True)
 
 
@@ -140,7 +224,7 @@ INDEX_HTML = """<!doctype html>
  #status{font-size:13px;color:#9c9;min-height:18px;margin-top:10px}
  .err{color:#f88!important}
 </style></head><body>
-<h1>💡 Hue control panel</h1>
+<h1>💡 Hue control panel <a href="/viz" style="font-size:13px">(song visualizer)</a></h1>
 <div class="row"><label>Program</label><select id="prog"></select></div>
 <div class="row" id="modeRow" style="display:none"><label>Mode</label>
  <select id="mode"><option value="streaming">streaming (fast)</option><option value="smooth">smooth (REST fades)</option></select></div>
@@ -204,5 +288,93 @@ setInterval(async()=>{
   s.textContent='▶ beatsync — '+(st.locked?('♪ '+st.bpm+' BPM'):'listening / warming up…');
 },1000);
 load();
+</script></body></html>
+"""
+
+
+VIZ_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Hue visualizer</title>
+<style>
+ body{font-family:-apple-system,system-ui,sans-serif;max-width:760px;margin:20px auto;padding:0 16px;background:#0c0c0c;color:#eee}
+ h1{font-size:20px} a{color:#6cf}
+ #cv{width:100%;background:#000;border-radius:12px;display:block;margin:10px 0}
+ audio{width:100%;margin:6px 0}
+ .row{margin:10px 0} label{display:block;font-size:13px;color:#aaa;margin-bottom:3px}
+ .val{float:right;color:#fff;font-variant-numeric:tabular-nums}
+ input[type=range]{width:100%} select,input[type=text],input[type=file]{background:#222;color:#eee;border:1px solid #444;border-radius:6px;padding:6px}
+ #status{font-size:13px;color:#9c9;min-height:18px}
+</style></head><body>
+<h1>🎚️ Hue visualizer <a href="/" style="font-size:13px">(control panel)</a></h1>
+<div class="row"><label>Drop in a song (wav/mp3/m4a/flac) — analyzed offline, audio stays in your browser</label>
+ <input type="file" id="file" accept="audio/*"></div>
+<div id="status">Pick a song to analyze.</div>
+<audio id="aud" controls></audio>
+<canvas id="cv" width="720" height="380"></canvas>
+<div id="ctrls"></div>
+<script>
+let sid=null, layout=[], fps=30, frames=null, vals={}, params=[], colors=[], timer=null;
+const $=id=>document.getElementById(id);
+const cv=$('cv'), ctx=cv.getContext('2d'), aud=$('aud');
+$('file').onchange=async e=>{
+  const file=e.target.files[0]; if(!file)return;
+  aud.src=URL.createObjectURL(file);
+  $('status').textContent='Analyzing (full-song madmom)… first run warms up ~20s.';
+  const fd=new FormData(); fd.append('audio', file);
+  const r=await fetch('/api/analyze',{method:'POST',body:fd}); const d=await r.json();
+  if(d.error){$('status').textContent='⚠ '+d.error; return;}
+  sid=d.score_id; layout=d.layout; params=d.params; colors=d.colors;
+  vals={}; params.forEach(p=>vals[p.name]=p.default);
+  $('status').textContent=`Tempo ${d.tempo} BPM · ${d.beats_per_bar}/bar · ${d.duration.toFixed(0)}s — press play`;
+  renderControls(); await fetchTimeline();
+};
+async function fetchTimeline(){
+  if(!sid)return;
+  const r=await fetch('/api/timeline',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({score_id:sid, params:vals})});
+  const d=await r.json(); if(d.error){$('status').textContent='⚠ '+d.error; return;}
+  fps=d.fps; frames=d.frames;
+}
+function renderControls(){
+  const c=$('ctrls'); c.innerHTML='';
+  params.forEach(p=>{
+    const v=vals[p.name], row=document.createElement('div'); row.className='row';
+    if(p.type==='color'){
+      row.innerHTML='<label>'+p.label+'</label>';
+      const s=document.createElement('select');
+      colors.forEach(col=>{const o=document.createElement('option');o.value=col;o.textContent=col;if(col===v)o.selected=true;s.appendChild(o);});
+      s.onchange=()=>{vals[p.name]=s.value;live();}; row.appendChild(s);
+    }else if(p.type==='text'){
+      row.innerHTML='<label>'+p.label+'</label>';
+      const t=document.createElement('input');t.type='text';t.value=v||'';t.style.width='100%';
+      t.oninput=()=>{vals[p.name]=t.value;live();}; row.appendChild(t);
+    }else{
+      const lab=document.createElement('label');lab.innerHTML=p.label+'<span class="val" id="v_'+p.name+'">'+(+v).toFixed(2)+'</span>';
+      const r=document.createElement('input');r.type='range';r.min=p.min;r.max=p.max;r.step=p.step;r.value=v;
+      r.oninput=()=>{vals[p.name]=parseFloat(r.value);$('v_'+p.name).textContent=parseFloat(r.value).toFixed(2);live();};
+      row.appendChild(lab);row.appendChild(r);
+    }
+    c.appendChild(row);
+  });
+}
+function live(){clearTimeout(timer);timer=setTimeout(fetchTimeline,180);}
+function draw(){
+  requestAnimationFrame(draw);
+  const W=cv.width,H=cv.height;
+  ctx.fillStyle='#000';ctx.fillRect(0,0,W,H);
+  if(!frames||!layout.length)return;
+  const idx=Math.max(0,Math.min(frames.length-1,Math.floor(aud.currentTime*fps)));
+  const f=frames[idx];
+  layout.forEach((lt,i)=>{
+    const c=f[i]||[0,0,0]; const [r,g,b]=c;
+    const cx=W/2+lt.x*0.42*W, cy=H/2-lt.y*0.42*H;
+    const bright=(r+g+b)/3;
+    ctx.shadowColor=`rgb(${r},${g},${b})`; ctx.shadowBlur=12+bright/255*55;
+    ctx.fillStyle=`rgb(${r},${g},${b})`;
+    ctx.beginPath(); ctx.arc(cx,cy,28,0,7); ctx.fill();
+    ctx.shadowBlur=0; ctx.fillStyle='#999'; ctx.font='11px sans-serif'; ctx.textAlign='center';
+    ctx.fillText(lt.name, cx, cy+46);
+  });
+}
+draw();
 </script></body></html>
 """

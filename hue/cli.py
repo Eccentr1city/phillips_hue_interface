@@ -24,6 +24,8 @@ def main():
         _cmd_scene(args[1:])
     elif cmd == "stop":
         _cmd_stop()
+    elif cmd == "beatsync":
+        _cmd_beatsync(args[1:])
     else:
         print(f"Unknown command: {cmd}")
         _print_help()
@@ -50,6 +52,10 @@ def _print_help():
     print("  scene set <name>                Apply a saved scene")
     print("  scene save <name>               Save current state as a scene")
     print("  stop                            Stop streaming effects")
+    print(
+        "  beatsync [--list] [--device <n>]    Sync lights to live audio "
+        "(loopback capture; --sensitivity/--gain/--decay tunable)"
+    )
     print()
     print("Lights: ID number, light name, 'all', or comma-separated list")
 
@@ -254,6 +260,22 @@ def _cmd_scene(args: list[str]):
     else:
         print(f"Unknown scene action: {action}")
         sys.exit(1)
+
+
+def _cmd_beatsync(args: list[str]):
+    from hue.audiosync import list_devices, run
+
+    if "--list" in args:
+        list_devices()
+        return
+    flags = _parse_flags(args)
+    run(
+        device=flags.get("device"),
+        sensitivity=float(flags.get("sensitivity", 1.4)),
+        gain=float(flags.get("gain", 6.0)),
+        decay=float(flags.get("decay", 0.16)),
+        floor=float(flags.get("floor", 0.04)),
+    )
 
 
 def _cmd_stop():

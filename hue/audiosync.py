@@ -180,6 +180,86 @@ class BandOnset:
         self._hist.append(energy)
 
 
+class BeatTracker:
+    """Online beat tracker: spectral-flux onset envelope -> autocorrelation tempo
+    -> phase-locked beat grid that predicts beats through gaps.
+
+    Fed one audio block at a time. Periodically (re)estimates tempo and re-locks
+    phase to the onsets; between updates the grid advances on its own clock, so
+    `beats_passed(now)` keeps emitting steady beats even during quiet bars and
+    ignores off-beat energy spikes (unlike raw onset detection).
+    """
+
+    def __init__(self, samplerate):
+        self.fr = samplerate / BLOCKSIZE  # onset frames per second (~43)
+        self._window = np.hanning(BLOCKSIZE)
+        self._prev_mag = None
+        self._buf = collections.deque(maxlen=int(self.fr * 6))  # ~6s of onsets
+        self.period = None  # seconds per beat
+        self.beat_ref = 0.0  # a known time that lands on a beat
+        self.bpm = 0.0
+        self.ready = False
+        self._last_update = 0.0
+        self._lmin = max(1, int(self.fr * 60 / 180))  # 180 BPM
+        self._lmax = int(self.fr * 60 / 70)  # 70 BPM
+
+    def push(self, mono, now):
+        if len(mono) != BLOCKSIZE:
+            return
+        mag = np.log1p(np.abs(np.fft.rfft(mono * self._window)))
+        if self._prev_mag is not None:
+            flux = float(np.sum(np.maximum(0.0, mag - self._prev_mag)))
+        else:
+            flux = 0.0
+        self._prev_mag = mag
+        self._buf.append(flux)
+        if now - self._last_update > 0.4 and len(self._buf) > self.fr * 3:
+            self._last_update = now
+            self._estimate(now)
+
+    def _estimate(self, now):
+        env = np.asarray(self._buf, dtype=np.float64)
+        n = len(env)
+        e = env - env.mean()
+        ac = np.correlate(e, e, "full")[n - 1 :]
+        if ac[0] <= 0:
+            self.ready = False
+            return
+        lo, hi = self._lmin, min(self._lmax, n - 1)
+        if hi <= lo:
+            return
+        lag = lo + int(np.argmax(ac[lo:hi]))
+        # Confidence: tempo peak must stand out vs the zero-lag energy.
+        if lag < 1 or ac[lag] / ac[0] < 0.10:
+            self.ready = False
+            return
+        period = lag / self.fr
+
+        # Phase: comb of the (positive) onset envelope at this lag.
+        pos = np.maximum(env, 0.0)
+        scores = [pos[off::lag].sum() for off in range(lag)]
+        best_off = int(np.argmax(scores))
+        latest_idx = best_off + ((n - 1 - best_off) // lag) * lag
+        beat_time = now - (n - 1 - latest_idx) / self.fr
+
+        if self.period is None:
+            self.period, self.beat_ref = period, beat_time
+        else:
+            self.period = 0.7 * self.period + 0.3 * period
+            err = (beat_time - self.beat_ref) % self.period
+            if err > self.period / 2:
+                err -= self.period
+            self.beat_ref += 0.5 * err  # gentle PLL phase correction
+        self.bpm = 60.0 / self.period
+        self.ready = True
+
+    def seconds_since_beat(self, now):
+        """Time since the most recent grid beat, or None if no tempo yet."""
+        if not self.ready or not self.period:
+            return None
+        return (now - self.beat_ref) % self.period
+
+
 def _connect(ip, api_key, client_key):
     import hue_entertainment_pykit as hep
 
@@ -270,6 +350,7 @@ class BeatSyncEngine:
         flav = BandOnset(
             samplerate, *FLAVOR_BAND, FLAVOR_SENSITIVITY, FLAVOR_REFRACTORY, p["floor"]
         )
+        tracker = BeatTracker(samplerate)
 
         def audio_cb(indata, frames, time_info, status):
             mono = indata.mean(axis=1) if indata.ndim > 1 else indata
@@ -277,6 +358,7 @@ class BeatSyncEngine:
             now = time.monotonic()
             bass.process(m, now)
             flav.process(m, now)
+            tracker.push(m, now)
 
         streaming = _connect(ip, api_key, client_key)
         light_to_channel, _ = _build_channel_maps(ip, api_key)
@@ -321,7 +403,14 @@ class BeatSyncEngine:
                 flav_k = 1.0 - np.exp(-interval / max(1e-3, FLAVOR_ATTACK))
 
                 now = time.monotonic()
-                target = min(1.0, bass.strength / max(0.05, p["pulse_scale"]))
+                # Anchor target: a pulse on the tracked beat grid (predicts
+                # through gaps); fall back to raw energy-follow when there's no
+                # confident tempo yet (intro/ambient) or during near-silence.
+                tsb = tracker.seconds_since_beat(now) if bass.level > p["floor"] else None
+                if tsb is not None:
+                    target = float(np.exp(-tsb / max(0.05, p["decay"])))
+                else:
+                    target = min(1.0, bass.strength / max(0.05, p["pulse_scale"]))
                 bass_env += (target - bass_env) * (
                     attack_k if target > bass_env else release_k
                 )

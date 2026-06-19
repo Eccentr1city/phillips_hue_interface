@@ -38,7 +38,11 @@ def _print_help():
     print(
         "  set <lights> --color <color>    Set color (and optionally --brightness 0-1)"
     )
-    print("  set <lights> --effect <name>    Start an effect")
+    print("  set <lights> --effect <name>    Start an effect (streaming)")
+    print(
+        "  set <lights> --effect <name> --smooth    Smooth mode (REST fades; "
+        "good for slow effects; --interval/--transition tunable)"
+    )
     print("  on [lights]                     Turn on (default: all)")
     print("  off [lights]                    Turn off (default: all)")
     print("  list                            List available effects and scenes")
@@ -101,6 +105,10 @@ def _cmd_set(args: list[str]):
         print("Usage: hue set <lights> --color <color> [--brightness <0-1>]")
         sys.exit(1)
 
+    # --smooth is a bare boolean flag; pull it out before parsing key/value flags.
+    smooth = "--smooth" in args
+    args = [a for a in args if a != "--smooth"]
+
     target = _parse_lights_target(args[0])
     flags = _parse_flags(args[1:])
     bridge = _get_bridge()
@@ -110,15 +118,55 @@ def _cmd_set(args: list[str]):
 
     if effect_name:
         from hue.effects import get_effect
-        from hue.stream import start_stream
 
         get_effect(effect_name)  # validate
+
+        # Any flags other than the reserved ones are passed to the effect as
+        # params (e.g. --speed 0.3 --width 0.5), numbers when parseable.
+        reserved = {"effect", "interval", "transition", "color", "brightness"}
+        params = {}
+        for key, value in flags.items():
+            if key in reserved:
+                continue
+            try:
+                params[key] = float(value)
+            except ValueError:
+                params[key] = value
+
         scene_data = {
-            "lights": {str(lt.id): {"effect": effect_name} for lt in resolved}
+            "lights": {
+                str(lt.id): {"effect": effect_name, "params": params} for lt in resolved
+            }
         }
-        pid = start_stream(bridge.ip, bridge.api_key, bridge.client_key, scene_data)
         names = ", ".join(lt.name for lt in resolved)
-        print(f"Effect '{effect_name}' started on {names} (pid={pid})")
+
+        if smooth:
+            # Smooth (REST + firmware fades) — for slow ambient effects.
+            from hue.smooth import start_smooth
+            from hue.stream import stop_stream
+
+            stop_stream()  # don't let both modes fight over the lights
+            interval = float(flags.get("interval", 0.4))
+            transition = float(flags.get("transition", 1.0))
+            pid = start_smooth(
+                bridge.ip,
+                bridge.api_key,
+                bridge.client_key,
+                scene_data,
+                interval,
+                transition,
+            )
+            print(
+                f"Effect '{effect_name}' started (smooth mode) on {names} (pid={pid})"
+            )
+        else:
+            # Streaming (entertainment / DTLS) — for fast effects.
+            from hue.smooth import stop_smooth
+            from hue.stream import start_stream
+
+            stop_smooth()
+            pid = start_stream(bridge.ip, bridge.api_key, bridge.client_key, scene_data)
+            print(f"Effect '{effect_name}' started on {names} (pid={pid})")
     else:
         color = flags.get("color")
         brightness = float(flags["brightness"]) if "brightness" in flags else None
@@ -200,8 +248,8 @@ def _cmd_scene(args: list[str]):
 
 def _cmd_stop():
     from hue.scene import stop_scene
+    from hue.smooth import stop_smooth
 
-    if stop_scene():
-        print("Streaming stopped.")
-    else:
-        print("No streaming process running.")
+    stopped = stop_scene()  # streaming daemon
+    stopped = stop_smooth() or stopped  # smooth daemon
+    print("Stopped." if stopped else "No effect running.")

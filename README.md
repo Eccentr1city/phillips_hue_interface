@@ -44,13 +44,17 @@ uv run python -m hue status                         # show all lights
 uv run python -m hue set all --color red             # set color
 uv run python -m hue set 1 --brightness 0.5          # set brightness
 uv run python -m hue set all --effect candle         # start streaming effect
+uv run python -m hue set all --effect wave --smooth  # smooth mode (REST fades)
 uv run python -m hue on                              # all lights on
 uv run python -m hue off 1                           # turn off light 1
 uv run python -m hue list                            # list effects and scenes
 uv run python -m hue scene save cozy                 # snapshot current state
 uv run python -m hue scene set cozy                  # restore a saved scene
-uv run python -m hue stop                            # stop streaming effects
+uv run python -m hue stop                            # stop any running effect
 ```
+
+Effect params pass through as flags: `--effect wave --smooth --speed 0.3 --width 0.6`.
+Smooth mode also takes `--interval` and `--transition` (seconds).
 
 ### Claude assistant integration
 
@@ -86,6 +90,26 @@ def render(t, speed=1.0, phase=0.0, **params):
     b = 50
     return (r, g, b)
 ```
+
+## Rendering modes
+
+There are two ways to drive an effect, because the bridge exposes two very
+different interfaces:
+
+- **Streaming** (default) — entertainment/DTLS, ~50fps, full 16-bit per-frame
+  control. Best for **fast** effects (e.g. `candle`). The bridge applies frames
+  discretely (no interpolation), so slow fades can visibly *step*; fast motion
+  hides this.
+- **Smooth** (`--smooth`) — REST keyframes (~0.4s) with a longer `transition`
+  time, so the **bulb firmware** does the fades and overlapping eases blend into
+  continuous motion (the same buttery fade the phone app produces). Best for
+  **slow ambient** effects (e.g. `wave`). Capped by the bridge's ~10–15 REST
+  commands/sec, so it's not for fast motion.
+
+Rule of thumb: slow/ambient → `--smooth`, fast/flickery → streaming. Starting one
+mode automatically stops the other; `hue stop` stops whichever is running. (The
+bridge does *not* interpolate streamed frames — verified — so there's no way to
+get the firmware fade through the streaming path.)
 
 ## Streaming architecture
 

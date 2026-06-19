@@ -9,3 +9,6 @@ __pycache__/
 
 # Per-deployment light geometry (real-world coords)
 positions.json
+.hue_smooth.pid
+.hue_smooth.log
+.hue_smooth_config.json
